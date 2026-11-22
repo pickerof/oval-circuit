@@ -135,7 +135,7 @@ class Arena:
             self.walk_cache[key] = self.clear(x, y, self.ground(x, y), radius, height)
         return self.walk_cache[key]
 
-    def nearest_open(self, point, radius, height, limit=4):
+    def nearest_open(self, point, radius, height, limit=4, reachable_from=None):
         x, y = self.cell(point)
         for r in range(limit + 1):
             ring = [(x + i, y + j) for i in range(-r, r + 1) for j in range(-r, r + 1)
@@ -143,12 +143,16 @@ class Arena:
             ring.sort(key=lambda cell: hypot(point[0] - cell[0] * self.grid,
                                              point[1] - cell[1] * self.grid))
             for cell in ring:
-                if self.open_cell(cell, radius, height):
-                    return cell
+                if not self.open_cell(cell, radius, height):
+                    continue
+                if reachable_from is not None and not self.walk_line(
+                        reachable_from, self.point(cell), max(1, radius - 0.45), height):
+                    continue
+                return cell
         return None
 
     def route(self, start, goal, radius, height, limit=330):
-        start_cell = self.nearest_open(start, radius, height)
+        start_cell = self.nearest_open(start, radius, height, reachable_from=start)
         goal_cell = self.nearest_open(goal, radius, height, limit=8)
         if start_cell is None or goal_cell is None:
             return []

@@ -3,6 +3,7 @@
 from math import asin, atan2, cos, hypot, pi, sin, sqrt
 
 from arena import Arena
+from dodge import avoid
 import mechfight
 
 
@@ -50,6 +51,12 @@ class Bot:
         self.tactical_time = -10
         self.location = None
         self.stuck = 0
+        self.progress_anchor = None
+        self.progress_time = 0
+        self.escape_goal = None
+        self.escape_until = 0
+        self.escape_history = []
+        self.force_climb = False
         self.damage_time = -100
         self.damage_bearing = None
         self.firing_time = -100
@@ -304,26 +311,73 @@ class Bot:
         self.tactical_time = t
         return self.tactical_goal
 
+    def escape(self, pos, goal, radius, height, t):
+        if distance(pos, goal) < 9:
+            self.progress_anchor = None
+            self.escape_goal = None
+            return None
+        if self.escape_goal is not None and t < self.escape_until and distance(pos, self.escape_goal) > 3:
+            return self.escape_goal
+        self.escape_goal = None
+        self.force_climb = False
+        if self.progress_anchor is None or distance(pos, self.progress_anchor) > 5:
+            self.progress_anchor = pos
+            self.progress_time = t
+            return None
+        if t - self.progress_time < 1.25:
+            return None
+
+        self.progress_anchor = pos
+        self.progress_time = t
+        self.route.clear()
+        self.route_goal = None
+        yaw = bearing(pos, goal)
+        options = []
+        for i in range(12):
+            angle = yaw + i * pi / 6
+            point = (pos[0] + 15 * cos(angle), pos[1] + 15 * sin(angle))
+            if self.arena.walk_line(pos, point, radius, height):
+                revisit = sum(max(0, 15 - distance(point, endpoint)) for endpoint in self.escape_history)
+                score = distance(point, goal) + revisit * 2.5 - 8 * abs(sin(i * pi / 6))
+                options.append((score, point))
+        if options:
+            self.escape_goal = min(options)[1]
+        else:
+            self.escape_goal = toward(pos, goal, 15)
+            self.force_climb = True
+        self.escape_until = t + 1.9
+        self.escape_history = (self.escape_history + [self.escape_goal])[-5:]
+        return self.escape_goal
+
     def navigate(self, pos, goal, radius, height, t):
         d = distance(pos, goal)
         if d < 1:
             return tuple(pos[:2])
+        route_changed = self.route_goal is None or distance(goal, self.route_goal) > 23
+        if route_changed:
+            self.route.clear()
         direct = toward(pos, goal, min(d, 29))
-        if self.arena.walk_line(pos, direct, radius, height):
+        if d <= 70 and self.arena.walk_line(pos, goal, radius, height):
             self.route.clear()
             return direct
-        if self.route_goal is None or t - self.route_time >= 0.8 or (
-                t - self.route_time >= 0.3 and distance(goal, self.route_goal) > 23):
-            self.route_goal = goal
-            self.route_time = t
-            self.route = self.arena.route(pos, goal, radius, height)
-        for i in range(min(6, len(self.route)) - 1, -1, -1):
+        if not self.route and not route_changed and t - self.route_time < 0.35:
+            if self.arena.walk_line(pos, direct, radius, height):
+                return direct
+        elif d > 70 and not self.route and self.arena.walk_line(pos, direct, radius, height):
+            return direct
+        else:
+            if route_changed or not self.route or t - self.route_time >= 2.1:
+                self.route_goal = goal
+                self.route_time = t
+                self.route = self.arena.route(pos, goal, radius, height)
+        for i in range(min(8, len(self.route)) - 1, -1, -1):
             point = self.route[i]
             if distance(pos, point) >= 2.4 and self.arena.walk_line(pos, point, radius, height):
                 self.route = self.route[i:]
                 return point
-        if self.route and distance(pos, self.route[0]) > 2.4:
-            return self.route[0]
+        self.route.clear()
+        if self.arena.walk_line(pos, direct, radius, height):
+            return direct
         yaw = bearing(pos, goal)
         for offset in (pi / 5, -pi / 5, pi / 2.5, -pi / 2.5, pi / 1.5, -pi / 1.5, pi):
             direction = yaw + offset
@@ -400,7 +454,8 @@ class Bot:
             strategic = pos
         if exposed and not urgent and strategic is not pos:
             strategic = self.tactical(obs, strategic, exposed, retreat, target, radius, height)
-        waypoint = self.navigate(pos, strategic, radius, height, t)
+        escape = self.escape(pos, strategic, radius, height, t)
+        waypoint = escape if escape is not None else self.navigate(pos, strategic, radius, height, t)
         d = distance(pos, waypoint)
         desired_speed = stats["walk_speed"]
         movement = toward((0, 0), (waypoint[0] - pos[0], waypoint[1] - pos[1]),
@@ -410,14 +465,18 @@ class Bot:
         else:
             self.stuck = 0
         self.location = pos
-        climb = self.stuck >= 5 or (not me["grounded"] and d > 4 and
+        climb = (escape is not None and self.force_climb) or self.stuck >= 5 or (not me["grounded"] and d > 4 and
                                     not self.arena.walk_line(pos, waypoint, radius, height))
         sprint = d > 5 and (urgent or retreat or (not exposed and distance(pos, strategic) > 100))
+        if escape is not None and self.force_climb and me["grounded"] and me["energy"] <= 28:
+            sprint = False
         jump = bool(me["grounded"] and climb and me["energy"] > 28)
         action["move"] = movement
         action["jump"] = jump
         action["boost"] = bool((climb and not me["grounded"] and me["energy"] > 14) or
                                (sprint and me["grounded"] and me["energy"] > (12 if urgent else 42)))
+        if not urgent and not jump and not climb and obs["projectiles"]:
+            action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
         if retreat and target and (target["kind"] != "mech" or
                                    (distance(pos, target["pos"]) > 42 and frac < 0.55)):
