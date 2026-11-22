@@ -76,6 +76,15 @@ class Arena:
         j = max(0, min(self.ny - 1, int((y - self.y0) / self.step + 0.5)))
         return self.terrain[j * self.nx + i] * self.scale
 
+    def support(self, x, y, ceiling):
+        surface = self.ground(x, y)
+        for left, right, bottom, top, _, roof, ring, holes in self.prisms.get(
+                (floor(x / self.bucket), floor(y / self.bucket)), ()):
+            if (surface < roof <= ceiling and left <= x <= right and bottom <= y <= top
+                    and inside(x, y, ring) and not any(inside(x, y, hole) for hole in holes)):
+                surface = roof
+        return surface
+
     def clear(self, x, y, z, radius, height):
         if not (self.bounds["minX"] + radius <= x <= self.bounds["maxX"] - radius and
                 self.bounds["minY"] + radius <= y <= self.bounds["maxY"] - radius):

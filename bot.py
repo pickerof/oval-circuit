@@ -74,6 +74,8 @@ class Bot:
         self.foreign_beams = set()
         self.peer_wounded = {}
         self.busy_peers = set()
+        self.motion = {}
+        self.acceleration = {}
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -190,6 +192,47 @@ class Bot:
             return None
         return yaw
 
+    def observe_motion(self, t, enemies):
+        next_motion = {}
+        next_acceleration = {}
+        for enemy in enemies:
+            enemy_id = enemy["id"]
+            velocity = enemy["vel"]
+            previous = self.motion.get(enemy_id)
+            if previous and 0 < t - previous[0] < self.dt * 1.5:
+                elapsed, last = t - previous[0], previous[1]
+                old = self.acceleration.get(enemy_id, (0, 0))
+                next_acceleration[enemy_id] = tuple(
+                    0.56 * value + 0.44 * max(-48, min(48, (v - prior) / elapsed))
+                    for value, v, prior in zip(old, velocity, last)
+                )
+            next_motion[enemy_id] = t, velocity
+        self.motion, self.acceleration = next_motion, next_acceleration
+
+    def projected_body(self, target, time, airborne, radius, height):
+        x, y, z = target["pos"]
+        vx, vy, vz = target["vel"]
+        ax, ay = self.acceleration.get(target["id"], (0, 0))
+        # Extrapolate acceleration briefly. The farther part of the shot assumes a straight run.
+        span = min(time, 0.16)
+        lead = span * (time - span * 0.5)
+        px, py = x + vx * time + ax * lead, y + vy * time + ay * lead
+        if airborne:
+            gravity = 0.0 if vz > 4 else self.config["mech"]["gravity"]
+            z += vz * time - gravity * time * time * 0.5
+        floor = self.arena.support(px, py, max(z, target["pos"][2]) + 1.1)
+        if not airborne or z < floor:
+            z = floor
+        if not self.arena.clear(px, py, z, radius, height):
+            # A wall often clips only one component of a sliding target's velocity.
+            if self.arena.clear(px, y, z, radius, height):
+                py = y
+            elif self.arena.clear(x, py, z, radius, height):
+                px = x
+            else:
+                px, py, z = target["pos"]
+        return px, py, z
+
     def target(self, obs, actors, muzzle):
         me = obs["self"]
         pos = me["pos"]
@@ -229,11 +272,18 @@ class Bot:
         px, py, pz = target["pos"]
         vx, vy, vz = target.get("vel", (0, 0, 0))
         radius, height = self.shape(target)
+        actor_is_mech = target["kind"] == "mech"
+        airborne = actor_is_mech and (
+            pz > self.arena.support(px, py, pz + 0.15) + 0.75 or vz > 2.5)
         time = self.dt * 0.4
         pitch = 0
         for _ in range(4):
-            x, y = px + vx * time, py + vy * time
-            z = pz + height * 0.56 + max(-height * 0.35, min(height * 0.45, vz * time))
+            if actor_is_mech and kind in ("gun", "laser"):
+                x, y, z = self.projected_body(target, time, airborne, self.config["mech"]["radius"], height)
+                z += height * 0.53
+            else:
+                x, y = px + vx * time, py + vy * time
+                z = pz + height * 0.56 + max(-height * 0.35, min(height * 0.45, vz * time))
             d = distance(muzzle, (x, y))
             dz = z - muzzle[2]
             travel = max(0.1, d - barrel)
@@ -254,6 +304,11 @@ class Bot:
                     time = self.dt * 0.4 + max(0, hypot(d, dz) - barrel) / stats["speed"]
         if kind != "mortar" and hypot(d, dz) > stats["range"] - (2 if kind == "lightning" else 0):
             return None
+        if kind in ("gun", "laser") and actor_is_mech and not self.arena.visible(muzzle, (x, y, z)):
+            raised = (x, y, z + height * 0.27)
+            if not self.arena.visible(muzzle, raised):
+                return None
+            pitch = atan2(raised[2] - muzzle[2], d)
         return bearing(muzzle, (x, y)), pitch, d, radius, height
 
     def combat(self, me, target, muzzle, retreat):
@@ -539,6 +594,7 @@ class Bot:
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: distance(pos, e["pos"]))
         self.observe_opponents(obs, enemies)
+        self.observe_motion(t, enemies)
         actors = enemies + [e for e in obs["mechs"] if e["kind"] == "npc"]
         actors += [dict(crate, kind="crate") for crate in obs["crates"]]
         target, exposed = self.target(obs, actors, muzzle)
