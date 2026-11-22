@@ -39,7 +39,7 @@ def toward(a, b, length):
 
 
 class Bot:
-    name = "Oval Circuit"
+    name = "Bing Shing"
 
     def __init__(self, hello):
         self.config = hello["config"]

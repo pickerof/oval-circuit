@@ -1,6 +1,6 @@
-# Oval Circuit
+# Bing Shing
 
-A Mech Royale entry for the Builders Buildathon. Oval Circuit routes around campus buildings, takes nearby loot and supply drops, leads shots against moving opponents, and seeks cover when it needs to recover.
+This is the local public-league candidate for Bing Shing, a Mech Royale entry for the Builders Buildathon. The bot routes around campus buildings, takes nearby loot and supply drops, leads shots against moving opponents, and seeks cover when it needs to recover.
 
 The bot uses Python's standard library and the official `mechfight.py` transport wrapper from the [Builders starter kit](https://www.joinbuilders.org/buildathon/tracks/builders). The scorer supplies the arena files at runtime.
 
