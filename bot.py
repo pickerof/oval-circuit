@@ -79,6 +79,9 @@ class Bot:
         self.acceleration = {}
         self.disengage_until = -100
         self.sprint_reserve = False
+        self.beam_cover = None
+        self.beam_cover_until = -100
+        self.beam_cover_search = -100
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -478,6 +481,65 @@ class Bot:
                 best = value, p
         return best[1] if best else None
 
+    def cover_from_charge(self, obs, enemies, radius, height):
+        t, me = obs["t"], obs["self"]
+        pos, stats = me["pos"], me["stats"]
+        if self.beam_cover is not None and t < self.beam_cover_until:
+            return self.beam_cover
+        self.beam_cover = None
+        if not me["grounded"] or t - self.beam_cover_search < 0.18:
+            return None
+
+        charging = []
+        for enemy in enemies:
+            if not enemy.get("charging") or "laser" not in enemy["weapons"]:
+                continue
+            p = enemy["pos"]
+            d = distance(p, pos)
+            if not 25 < d < 196 or angle_error(enemy["aim"][0], bearing(p, pos)) > 0.36:
+                continue
+            enemy_eye = (*p[:2], p[2] + self.shape(enemy)[1] * 0.78)
+            own_eye = (*pos[:2], pos[2] + height * 0.75)
+            if self.arena.visible(enemy_eye, own_eye, stride=3.2):
+                charging.append((d, enemy_eye))
+        if not charging:
+            return None
+
+        self.beam_cover_search = t
+        _, source = min(charging)
+        vx, vy = me["vel"][:2]
+        own_charge = any(w and w.get("charge", 0) for w in me["weapons"])
+        boost = me["energy"] >= 27
+        speed = stats["boost_speed"] if boost else stats["walk_speed"]
+        if own_charge:
+            speed *= stats["charge_move_mult"]
+        axis = bearing(pos, source)
+        options = []
+        for offset in (pi/2, -pi/2, pi/3, -pi/3, 2*pi/3, -2*pi/3, 0, pi):
+            yaw = axis + offset
+            dx, dy = cos(yaw), sin(yaw)
+            aligned_speed = vx * dx + vy * dy
+            acceleration_time = max(0, speed - aligned_speed) / stats["ground_accel"]
+            reach = max(2.0, speed * (0.61 - min(0.35, acceleration_time * 0.5)))
+            for length in (reach * 0.65, reach):
+                point = (pos[0] + dx * length, pos[1] + dy * length)
+                if self.zone_cost(point, obs["zone"], t) > self.zone_cost(pos, obs["zone"], t) + 8:
+                    continue
+                if not self.arena.walk_line(pos, point, radius, height):
+                    continue
+                floor = self.arena.support(*point, pos[2] + 1.2)
+                top = (*point, floor + height * 0.94)
+                middle = (*point, floor + height * 0.50)
+                if self.arena.visible(source, top, stride=2.6) or self.arena.visible(source, middle, stride=2.6):
+                    continue
+                score = length / speed + acceleration_time * 0.22
+                options.append((score, point, boost))
+        if options:
+            _, point, boost = min(options)
+            self.beam_cover = (point, boost)
+            self.beam_cover_until = t + 0.64
+        return self.beam_cover
+
     def tactical(self, obs, strategic, threats, retreat, target, radius, height):
         t, me = obs["t"], obs["self"]
         pos = me["pos"]
@@ -742,7 +804,13 @@ class Bot:
             self.zone_jumped |= bool(jump)
             action["jump"] = bool(jump)
             action["boost"] = bool(not me["grounded"] and self.zone_jumped and me["energy"] > 7)
-        if not urgent and not jump and not climb and obs["projectiles"]:
+        beam_cover = None if urgent or jump or climb else self.cover_from_charge(obs, enemies, radius, height)
+        if beam_cover is not None:
+            point, boost = beam_cover
+            pace = min(1, distance(pos, point) / max(1, stats["walk_speed"] * 0.24))
+            action["move"] = toward((0, 0), (point[0] - pos[0], point[1] - pos[1]), pace)
+            action["boost"] = boost and me["energy"] >= 10 and pace > 0.4
+        elif not urgent and not jump and not climb and obs["projectiles"]:
             action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
         fight_while_withdrawing = bool(retreat and target and target["kind"] == "mech" and
