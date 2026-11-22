@@ -1,5 +1,6 @@
 """Survival, loot, and combat policy for Mech Royale."""
 
+from collections import deque
 from math import asin, atan2, cos, hypot, pi, sin, sqrt
 
 from arena import Arena
@@ -61,6 +62,7 @@ class Bot:
         self.zone_escape = None
         self.zone_jumped = False
         self.last_damage = {}
+        self.recent_fire = deque()
         self.damage_time = -100
         self.damage_bearing = None
         self.firing_time = -100
@@ -164,6 +166,29 @@ class Bot:
         if self.opportunity(obs, enemy, d) and me["hp"] > 310:
             return True
         return toward_me and d < 92 and me["hp"] > hp * 1.18
+
+    def rear_guard(self, obs, target, aim):
+        """Face the biggest immediate threat when another target would expose our rear."""
+        t = obs["t"]
+        while self.recent_fire and t - self.recent_fire[0][0] > 1.35:
+            self.recent_fire.popleft()
+        incoming = {}
+        for time, attacker, yaw, amount in self.recent_fire:
+            weight = amount * max(0, 1 - (t - time) / 1.35)
+            old = incoming.get(attacker, (0, yaw))
+            incoming[attacker] = old[0] + weight, yaw
+        if not incoming:
+            return None
+        attacker = max(incoming, key=lambda i: incoming[i][0])
+        damage, yaw = incoming[attacker]
+        if target and attacker == target["id"]:
+            return None
+        target_pressure = incoming.get(target["id"], (0, 0))[0] if target else 0
+        if damage < max(55, target_pressure * 1.45):
+            return None
+        if aim is not None and angle_error(yaw, aim[0]) < 1.23:
+            return None
+        return yaw
 
     def target(self, obs, actors, muzzle):
         me = obs["self"]
@@ -499,6 +524,9 @@ class Bot:
                 if event.get("bearing") is not None:
                     self.last_damage[event.get("by")] = t
                     self.damage_bearing = event["bearing"]
+                    attacker = event.get("by")
+                    if isinstance(attacker, int) and 0 <= attacker < self.config["match"]["mechs"]:
+                        self.recent_fire.append((t, attacker, event["bearing"], event["amount"]))
             elif event["type"] == "hit":
                 self.firing_time = t
 
@@ -632,6 +660,10 @@ class Bot:
                 aim = [yaw + 0.62 * sin(t * 2.1), 0]
             else:
                 aim = [me["aim"][0] + self.dt * 1.9, 0]
+        guard = self.rear_guard(obs, target, aim)
+        if guard is not None:
+            aim = [guard, 0]
+            fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0)) for w in me["weapons"]]
         action["aim"] = aim
         action["fire"] = fire
         gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
