@@ -44,7 +44,8 @@ class Bot:
     def __init__(self, hello):
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"], self.config["mech"])
-        self.dt = self.config["match"]["decide_every"] / self.config["match"]["tick_hz"]
+        self.tick_seconds = 1 / self.config["match"]["tick_hz"]
+        self.dt = self.config["match"]["decide_every"] * self.tick_seconds
         self.route = []
         self.route_goal = None
         self.route_time = -10
@@ -309,7 +310,7 @@ class Bot:
         actor_is_mech = target["kind"] == "mech"
         airborne = actor_is_mech and (
             pz > self.arena.support(px, py, pz + 0.15) + 0.75 or vz > 2.5)
-        time = self.dt * 0.4
+        time = self.tick_seconds if kind == "laser" else self.dt * 0.4
         pitch = 0
         for _ in range(4):
             if actor_is_mech and kind in ("gun", "laser"):
@@ -335,7 +336,8 @@ class Bot:
             else:
                 pitch = atan2(dz, d)
                 if kind == "gun":
-                    time = self.dt * 0.4 + max(0, hypot(d, dz) - barrel) / stats["speed"]
+                    # Projectiles advance on the firing tick after all bodies have moved.
+                    time = self.tick_seconds * 0.5 + max(0, hypot(d, dz) - barrel) / stats["speed"]
         if kind != "mortar" and hypot(d, dz) > stats["range"] - (2 if kind == "lightning" else 0):
             return None
         if kind in ("gun", "laser") and actor_is_mech and not self.arena.visible(muzzle, (x, y, z)):
@@ -345,13 +347,38 @@ class Bot:
             pitch = atan2(raised[2] - muzzle[2], d)
         return bearing(muzzle, (x, y)), pitch, d, radius, height
 
+    def planned_muzzle(self, me, action):
+        pos, stats = me["pos"], me["stats"]
+        vx, vy, vz = me["vel"]
+        grounded = me["grounded"] and not action["jump"]
+        speed = stats["boost_speed"] if grounded and action["boost"] else stats["walk_speed"]
+        if any(w and w.get("charge", 0) for w in me["weapons"]):
+            speed *= stats["charge_move_mult"]
+        if not grounded:
+            speed = max(speed, min(hypot(vx, vy), stats["boost_speed"]))
+        mx, my = action["move"]
+        ax, ay = mx * speed - vx, my * speed - vy
+        acceleration = stats["ground_accel"] if grounded else stats["air_accel"]
+        dt = self.tick_seconds
+        fraction = min(1, acceleration * dt / max(0.001, hypot(ax, ay)))
+        x = pos[0] + (vx + fraction * ax) * dt
+        y = pos[1] + (vy + fraction * ay) * dt
+        if grounded:
+            z = max(pos[2] - 0.35, self.arena.support(x, y, pos[2] + stats["step_up"]))
+        else:
+            vz = stats["jump_speed"] if action["jump"] else vz
+            z = max(self.arena.ground(x, y), pos[2] + (vz - stats["gravity"] * dt) * dt)
+        if not self.arena.clear(x, y, z, self.config["mech"]["radius"], stats["height"]):
+            x, y, z = pos
+        return x, y, z + stats["muzzle_height"]
+
     def combat(self, me, target, muzzle, retreat):
         weapons = me["weapons"]
         stats = me["stats"]
         fire = [False, False]
         if target is None:
             return None, fire
-        mortar_muzzle = (*muzzle[:2], me["pos"][2] + stats["height"] + 0.5)
+        mortar_muzzle = (*me["pos"][:2], me["pos"][2] + stats["height"] + 0.5)
         barrel = stats["radius"] + 0.5
         shots = [self.shot(weapon, target, mortar_muzzle if weapon["kind"] == "mortar" else muzzle, barrel)
                  if weapon else None for weapon in weapons]
@@ -750,6 +777,8 @@ class Bot:
         if retreat and target and not fight_while_withdrawing and (
                 target["kind"] != "mech" or (distance(pos, target["pos"]) > 42 and frac < 0.55)):
             target = None
+        if target is not None:
+            muzzle = self.planned_muzzle(me, action)
         aim, fire = self.combat(me, target, muzzle, retreat and not fight_while_withdrawing)
         if aim is None:
             if self.damage_bearing is not None and t - self.damage_time < 1.4:
