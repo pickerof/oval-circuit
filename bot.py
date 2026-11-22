@@ -57,6 +57,9 @@ class Bot:
         self.escape_until = 0
         self.escape_history = []
         self.force_climb = False
+        self.zone_progress = None
+        self.zone_escape = None
+        self.zone_jumped = False
         self.last_damage = {}
         self.damage_time = -100
         self.damage_bearing = None
@@ -297,24 +300,30 @@ class Bot:
             yaw = direction + i * pi / 6
             options.append((pos[0] + 19 * cos(yaw), pos[1] + 19 * sin(yaw)))
         ranked = []
+        target_id = target["id"] if target and target["kind"] == "mech" else None
         for point in options:
             endpoint = toward(pos, point, min(20, distance(pos, point)))
             if distance(pos, endpoint) < 1 or not self.arena.walk_line(pos, endpoint, radius, height):
                 continue
             score = self.zone_cost(endpoint, obs["zone"], t)
             score += (distance(endpoint, strategic) - distance(pos, strategic)) * 0.36
-            for i, enemy in enumerate(threats[:3]):
+            for i, enemy in enumerate(threats[:4]):
                 enemy_pos = enemy["pos"]
                 d = distance(endpoint, enemy_pos)
                 if retreat:
                     score += max(0, ideal - d) * (0.85 if i == 0 else 0.45)
                 else:
                     score += max(0, ideal - d) * 1.15 + max(0, d - ideal - 12) * (0.48 if i == 0 else 0)
-                if d < 120 and (retreat or enemy is target):
-                    eye = (*endpoint, max(pos[2], self.arena.ground(*endpoint)) + height * 0.65)
+                if d < 142:
+                    eye = (*endpoint, self.arena.ground(*endpoint) + height * 0.65)
                     other = (*enemy_pos[:2], enemy_pos[2] + self.shape(enemy)[1] * 0.75)
-                    clear = self.arena.visible(eye, other, stride=4)
-                    score += (27 if retreat else -8) if clear else 0
+                    if self.arena.visible(eye, other, stride=4):
+                        if enemy["id"] == target_id:
+                            score += 24 if retreat else -11
+                        else:
+                            aligned = angle_error(enemy["aim"][0], bearing(enemy_pos, endpoint)) < 0.9
+                            recently_hit = t - self.last_damage.get(enemy["id"], -100) < 4
+                            score += 22 if aligned or recently_hit else 10
             # Prefer lateral motion in a duel and retain momentum on near ties.
             score -= (me["vel"][0] * (endpoint[0] - pos[0]) +
                       me["vel"][1] * (endpoint[1] - pos[1])) * 0.017
@@ -422,6 +431,10 @@ class Bot:
         actors = enemies + [e for e in obs["mechs"] if e["kind"] == "npc"]
         actors += [dict(crate, kind="crate") for crate in obs["crates"]]
         target, exposed = self.target(obs, actors, muzzle)
+        known_threats = [enemy for enemy in enemies if distance(pos, enemy["pos"]) < 155]
+        if target and target["kind"] == "mech":
+            known_threats.sort(key=lambda enemy: (enemy["id"] != target["id"],
+                                                  distance(pos, enemy["pos"])))
         exposed.sort(key=lambda e: distance(pos, e["pos"]))
         near = [e for e in exposed if distance(pos, e["pos"]) < 115]
         frac = me["hp"] / me["max_hp"]
@@ -437,7 +450,7 @@ class Bot:
         current_margin = zone["radius"] - distance(pos, zone["center"])
         next_margin = zone["next_radius"] - distance(pos, center)
         urgent = not me["in_zone"] or (current_margin < 19 and next_margin < 8 and t >= zone["shrink_start"] - 2)
-        drop = self.drop_goal(obs, exposed)
+        drop = self.drop_goal(obs, known_threats)
 
         if urgent:
             strategic = zone_goal
@@ -465,10 +478,25 @@ class Bot:
             strategic = (pos[0] - 30 * cos(yaw), pos[1] - 30 * sin(yaw))
         if drop is not None and strategic is drop and distance(pos, drop) <= 5:
             strategic = pos
-        if exposed and not urgent and strategic is not pos:
-            strategic = self.tactical(obs, strategic, exposed, retreat, target, radius, height)
+        if known_threats and not urgent and strategic is not pos:
+            strategic = self.tactical(obs, strategic, known_threats, retreat, target, radius, height)
+        if not urgent:
+            self.zone_progress = None
+            self.zone_escape = None
+        elif self.zone_escape is None:
+            if self.zone_progress is None or distance(pos, self.zone_progress[0]) > 15:
+                self.zone_progress = pos, t
+            elif t - self.zone_progress[1] > 2.8:
+                self.zone_escape = toward(pos, zone_goal, min(29, distance(pos, zone_goal)))
+                self.zone_jumped = False
+        if self.zone_escape is not None and (distance(pos, self.zone_escape) < 4 or
+                                            (self.zone_jumped and me["grounded"])):
+            self.zone_escape = None
+            self.zone_progress = pos, t
         escape = self.escape(pos, strategic, radius, height, t)
         waypoint = escape if escape is not None else self.navigate(pos, strategic, radius, height, t)
+        if self.zone_escape is not None:
+            waypoint = self.zone_escape
         d = distance(pos, waypoint)
         desired_speed = stats["walk_speed"]
         movement = toward((0, 0), (waypoint[0] - pos[0], waypoint[1] - pos[1]),
@@ -488,13 +516,20 @@ class Bot:
         action["jump"] = jump
         action["boost"] = bool((climb and not me["grounded"] and me["energy"] > 14) or
                                (sprint and me["grounded"] and me["energy"] > (12 if urgent else 42)))
+        if self.zone_escape is not None:
+            jump = me["grounded"] and me["energy"] >= 54
+            self.zone_jumped |= bool(jump)
+            action["jump"] = bool(jump)
+            action["boost"] = bool(not me["grounded"] and self.zone_jumped and me["energy"] > 7)
         if not urgent and not jump and not climb and obs["projectiles"]:
             action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
-        if retreat and target and (target["kind"] != "mech" or
-                                   (distance(pos, target["pos"]) > 42 and frac < 0.55)):
+        fight_while_withdrawing = bool(retreat and target and target["kind"] == "mech" and
+                                      len(near) == 1 and target["id"] == near[0]["id"])
+        if retreat and target and not fight_while_withdrawing and (
+                target["kind"] != "mech" or (distance(pos, target["pos"]) > 42 and frac < 0.55)):
             target = None
-        aim, fire = self.combat(me, target, muzzle, retreat)
+        aim, fire = self.combat(me, target, muzzle, retreat and not fight_while_withdrawing)
         if aim is None:
             if self.damage_bearing is not None and t - self.damage_time < 1.4:
                 aim = [self.damage_bearing, 0]
