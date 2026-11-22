@@ -278,7 +278,13 @@ class Bot:
             elif kind == "lightning" and me["energy"] >= state["energy"] + (8 if retreat else 2):
                 score = 5 if weapon["cooldown"] < self.dt else 1
             elif kind == "laser" and not retreat:
-                score = 7 if weapon.get("charge", 0) else (4 if weapon["cooldown"] < self.dt else 0)
+                charge = weapon.get("charge", 0)
+                if charge >= state["charge"] - self.dt * 0.25:
+                    score = 7
+                elif charge:
+                    score = 1
+                elif weapon["cooldown"] < self.dt:
+                    score = 4
             elif kind == "mortar" and weapon["cooldown"] <= self.dt:
                 score = 4 if shots[index][2] < 90 or target["kind"] != "mech" else 2
             priority.append((score, index))
