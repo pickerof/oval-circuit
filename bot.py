@@ -622,8 +622,14 @@ class Bot:
         exposed.sort(key=lambda e: distance(pos, e["pos"]))
         near = [e for e in exposed if distance(pos, e["pos"]) < 115]
         frac = me["hp"] / me["max_hp"]
+        gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
+        lone_pursuer = (not self.ffa and len(known_threats) == 1 and target
+                        and target["id"] == known_threats[0]["id"]
+                        and t - self.last_damage.get(target["id"], -100) < 2)
         retreat = (frac < 0.43 or (frac < 0.67 and len(near) >= 2) or
                    (frac < 0.74 and t - self.damage_time > 1.9 and t - self.firing_time > 1.9))
+        if lone_pursuer and frac < 0.70 and gun and gun.get("reload", 0) > 0.5:
+            retreat = True
         if self.ffa and obs["alive"] > 3 and not (target and target["kind"] == "mech") and near:
             retreat = True
         if len(near) == 1 and near[0].get("hp", 1400) < min(270, me["hp"] * 0.48):
@@ -724,7 +730,7 @@ class Bot:
             action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
         fight_while_withdrawing = bool(retreat and target and target["kind"] == "mech" and
-                                      len(near) == 1 and target["id"] == near[0]["id"])
+                                      (lone_pursuer or (len(near) == 1 and target["id"] == near[0]["id"])))
         if retreat and target and not fight_while_withdrawing and (
                 target["kind"] != "mech" or (distance(pos, target["pos"]) > 42 and frac < 0.55)):
             target = None
@@ -748,7 +754,6 @@ class Bot:
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0)) for w in me["weapons"]]
         action["aim"] = aim
         action["fire"] = fire
-        gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
         if gun and gun.get("reload", 0) == 0 and gun.get("ammo", 0) < gun["stats"]["mag"] * 0.6:
             action["reload"] = target is None and t - self.firing_time > 0.55
         return action
