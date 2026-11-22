@@ -8,9 +8,9 @@ import mechfight
 
 WEAPON_VALUE = {"gun": 0, "mortar": 1, "lightning": 2, "laser": 3}
 UPGRADE_VALUE = {
-    "nanites": 10, "servos": 9, "gun_mag": 8.5, "gun_damage": 8,
-    "plating": 7.5, "armor": 7, "laser_damage": 6.8, "laser_charge": 6.5,
-    "gun_rate": 6, "reactor": 5.5, "lightning_range": 5,
+    "gun_mag": 11, "gun_damage": 10, "nanites": 9, "armor": 8.5,
+    "plating": 8, "servos": 7.8, "gun_rate": 7.5, "lightning_range": 7,
+    "laser_damage": 6.8, "laser_charge": 6.5, "reactor": 5.5,
     "gun_velocity": 4.5, "jets": 4, "capacitor": 3.5, "sensors": 3,
     "gyros": 2.5, "lightning_efficiency": 2, "mortar_reload": 1.5,
 }
@@ -51,6 +51,8 @@ class Bot:
         self.location = None
         self.stuck = 0
         self.damage_time = -100
+        self.recovering = False
+        self.attacker = None
         self.damage_bearing = None
         self.firing_time = -100
         self.target_id = None
@@ -96,7 +98,9 @@ class Bot:
             score = d + actor.get("hp", 1400) * 0.035
             score += {"mech": -65, "npc": 4, "crate": 0}[actor["kind"]]
             if actor["id"] == self.target_id:
-                score -= 13
+                score -= 16
+            if actor["id"] == self.attacker and obs["t"] - self.damage_time < 2:
+                score -= 25
             if actor["kind"] == "mech":
                 if actor.get("charging"):
                     score -= 18
@@ -220,21 +224,23 @@ class Bot:
             if dz < 6 and d < (125 if kind == "laser" else 85):
                 candidates.append((d - 18 * WEAPON_VALUE[kind], pickup["id"], p))
         take.pop("value", None)
-        if safe_to_farm:
+        if safe_to_farm or me["cubes"] < 10:
             for cube in obs["cubes"]:
                 d = distance(pos, cube["pos"])
                 if abs(pos[2] - cube["pos"][2]) < 5 and d < 115:
-                    candidates.append((d - (58 if me["cubes"] < 10 else 12), cube["id"], cube["pos"]))
+                    if safe_to_farm or d <= 17:
+                        candidates.append((d - (65 if me["cubes"] < 10 else 12), cube["id"], cube["pos"]))
+        if safe_to_farm:
             for crate in obs["crates"]:
                 d = distance(pos, crate["pos"])
                 if abs(pos[2] - crate["pos"][2]) < 5 and d < 115:
-                    approach = toward(crate["pos"], pos, min(d, 18))
+                    approach = toward(crate["pos"], pos, min(d, 27))
                     candidates.append((d + crate["hp"] * 0.08, crate["id"], approach))
             for actor in obs["mechs"]:
                 if actor["kind"] == "npc" and distance(pos, actor["pos"]) < 105:
                     d = distance(pos, actor["pos"])
                     if abs(pos[2] - actor["pos"][2]) < 5:
-                        approach = toward(actor["pos"], pos, min(d, 35))
+                        approach = toward(actor["pos"], pos, min(d, 48))
                         candidates.append((d - 8, actor["id"], approach))
         zone, t = obs["zone"], obs["t"]
         if candidates:
@@ -274,6 +280,9 @@ class Bot:
         if retreat:
             ideal = 105
         options = [strategic]
+        if retreat and distance(pos, strategic) < 1 and not any(
+                distance(pos, enemy["pos"]) < 65 for enemy in threats):
+            return strategic
         for i in range(12):
             yaw = direction + i * pi / 6
             options.append((pos[0] + 19 * cos(yaw), pos[1] + 19 * sin(yaw)))
@@ -283,7 +292,8 @@ class Bot:
             if distance(pos, endpoint) < 1 or not self.arena.walk_line(pos, endpoint, radius, height):
                 continue
             score = self.zone_cost(endpoint, obs["zone"], t)
-            score += (distance(endpoint, strategic) - distance(pos, strategic)) * 0.36
+            commitment = 1.4 if 0 < distance(pos, strategic) < 20 else 0.4
+            score += (distance(endpoint, strategic) - distance(pos, strategic)) * commitment
             for i, enemy in enumerate(threats[:3]):
                 enemy_pos = enemy["pos"]
                 d = distance(endpoint, enemy_pos)
@@ -346,6 +356,7 @@ class Bot:
             if event["type"] == "damaged":
                 self.damage_time = t
                 if event.get("bearing") is not None:
+                    self.attacker = event.get("by")
                     self.damage_bearing = event["bearing"]
             elif event["type"] == "hit":
                 self.firing_time = t
@@ -358,10 +369,12 @@ class Bot:
         exposed.sort(key=lambda e: distance(pos, e["pos"]))
         near = [e for e in exposed if distance(pos, e["pos"]) < 115]
         frac = me["hp"] / me["max_hp"]
-        retreat = (frac < 0.43 or (frac < 0.67 and len(near) >= 2) or
-                   (frac < 0.74 and t - self.damage_time > 1.9 and t - self.firing_time > 1.9))
-        if len(near) == 1 and near[0].get("hp", 1400) < min(270, me["hp"] * 0.48):
-            retreat = False
+        if frac >= 0.89:
+            self.recovering = False
+        elif frac < 0.55 or (frac < 0.73 and len(near) >= 2):
+            self.recovering = True
+        finishable = len(near) == 1 and near[0].get("hp", 1400) < min(310, me["hp"] * 0.58)
+        retreat = self.recovering and not finishable
 
         take, loot_goal = self.loot(obs, safe_to_farm=not near and not retreat)
         action.update(take)
@@ -376,7 +389,7 @@ class Bot:
             strategic = zone_goal
         elif drop is not None and (not near or frac < 0.8):
             strategic = drop
-        elif loot_goal is not None and not near and not retreat:
+        elif loot_goal is not None and not retreat and (not near or distance(pos, loot_goal) <= 17):
             strategic = loot_goal
         elif zone["radius"] <= 65 or (next_margin < 14 and t > zone["shrink_start"] - 12):
             strategic = toward(zone_goal, center, min(15, distance(zone_goal, center)))
@@ -391,7 +404,7 @@ class Bot:
             if next_margin < 15:
                 strategic = zone_goal
 
-        if retreat and not exposed and t - self.damage_time > 0.8 and next_margin > 16 and drop is None:
+        if retreat and not near and t - self.damage_time > 0.8 and next_margin > 16 and drop is None:
             strategic = pos
         if retreat and not exposed and t - self.damage_time <= 0.8 and self.damage_bearing is not None and not urgent:
             yaw = self.damage_bearing
@@ -420,7 +433,7 @@ class Bot:
                                (sprint and me["grounded"] and me["energy"] > (12 if urgent else 42)))
 
         if retreat and target and (target["kind"] != "mech" or
-                                   (distance(pos, target["pos"]) > 42 and frac < 0.55)):
+                                   distance(pos, target["pos"]) > 28):
             target = None
         aim, fire = self.combat(me, target, muzzle, retreat)
         if aim is None:
