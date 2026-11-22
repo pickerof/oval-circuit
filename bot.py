@@ -83,6 +83,10 @@ class Bot:
         self.shelter_time = -100
         self.shelter_costs = {}
         self.tactical_retreat = None
+        self.known_loot = {}
+        self.loot_clock = -100
+        self.loot_plan = None
+        self.mortar_cooloff = -100
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -273,6 +277,8 @@ class Bot:
             score += {"mech": -65, "npc": -26, "crate": 0}[actor["kind"]]
             if actor["id"] == self.target_id:
                 score -= 13
+            if self.loot_plan and actor["id"] == self.loot_plan[1]:
+                score -= 20
             if actor["kind"] == "mech":
                 if actor.get("charging"):
                     score -= 18
@@ -334,6 +340,25 @@ class Bot:
             pitch = atan2(raised[2] - muzzle[2], d)
         return bearing(muzzle, (x, y)), pitch, d, radius, height
 
+    def laser_release(self, me, target, weapon):
+        stats = weapon["stats"]
+        charge = weapon.get("charge", 0)
+        if charge >= stats["charge"] - self.dt * 0.25:
+            return True
+        if charge < stats["min_charge"] or "hp" not in target:
+            return False
+        cubes = self.config["cubes"]
+        strength = 1 + min(me["cubes"], cubes["stat_cap"]) * cubes["damage_per_cube"]
+        dose = stats["min_frac"] + (1 - stats["min_frac"]) * charge / stats["charge"]
+        damage = strength * stats["damage"] * dose
+        if target["kind"] == "mech":
+            if "mortar" in target["weapons"]:
+                damage *= 1 + stats["cookoff"]
+            if angle_error(target["aim"][0], bearing(target["pos"], me["pos"])) > 2:
+                damage *= self.config["mech"]["rear_mult"]
+            damage *= 0.82
+        return target["hp"] < damage
+
     def combat(self, me, target, muzzle, retreat):
         weapons = me["weapons"]
         stats = me["stats"]
@@ -355,9 +380,9 @@ class Bot:
                 score = 3 if weapon.get("reload", 0) == 0 and weapon.get("ammo", 0) > 0 else 0
             elif kind == "lightning" and me["energy"] >= state["energy"] + (8 if retreat else 2):
                 score = 5 if weapon["cooldown"] < self.dt else 1
-            elif kind == "laser" and not retreat:
+            elif kind == "laser" and (not retreat or weapon.get("charge", 0)):
                 charge = weapon.get("charge", 0)
-                if charge >= state["charge"] - self.dt * 0.25:
+                if self.laser_release(me, target, weapon):
                     score = 7
                 elif charge:
                     score = 1
@@ -392,7 +417,7 @@ class Bot:
                 if retreat and not charge:
                     continue
                 if charge:
-                    fire[index] = (charge < state["charge"] - self.dt * 0.25 or not lined_up)
+                    fire[index] = not self.laser_release(me, target, weapon) or not lined_up
                 else:
                     fire[index] = index == chosen and weapon["cooldown"] <= self.dt and lined_up
             elif lined_up and weapon["cooldown"] <= self.dt:
@@ -404,10 +429,11 @@ class Bot:
         me = obs["self"]
         pos = me["pos"]
         held = {w["kind"] for w in me["weapons"] if w}
+        values = dict(WEAPON_VALUE, lightning=4) if obs["zone"]["next_radius"] < 65 else WEAPON_VALUE
         slot = next((i for i, w in enumerate(me["weapons"]) if w is None), None)
         swap = None if slot is not None else next(
-            (i for i, w in enumerate(me["weapons"]) if w["kind"] not in ("gun", "laser")), None)
-        value = -1 if swap is None else WEAPON_VALUE[me["weapons"][swap]["kind"]]
+            (i for i, w in enumerate(me["weapons"]) if w["kind"] != "gun" and not w.get("charge")), None)
+        value = -1 if swap is None else values[me["weapons"][swap]["kind"]]
         candidates = []
         take = {}
         for pickup in obs["pickups"]:
@@ -415,13 +441,13 @@ class Bot:
             kind = pickup["kind"]
             if kind == "gun" or kind in held or (slot is None and swap is None):
                 continue
-            if WEAPON_VALUE[kind] <= value:
+            if values[kind] <= value or (kind == "mortar" and obs["t"] < self.mortar_cooloff):
                 continue
             d = distance(pos, p)
             dz = abs(pos[2] - p[2])
             if d <= self.config["loot"]["pickup_radius"] and dz <= 4:
-                if "take" not in take or WEAPON_VALUE[kind] > take["value"]:
-                    take = {"take": pickup["id"], "value": WEAPON_VALUE[kind]}
+                if "take" not in take or values[kind] > take["value"]:
+                    take = {"take": pickup["id"], "value": values[kind]}
                     if swap is not None:
                         take["drop"] = swap
             if dz < 6 and d < (100 if kind == "laser" else 72):
@@ -448,6 +474,56 @@ class Bot:
             candidates = [(score + self.zone_cost(p, zone, t), i, p) for score, i, p in candidates]
             return take, min(candidates)[2]
         return take, None
+
+    def harvest(self, obs, threats, safe_to_farm):
+        me, t, zone = obs["self"], obs["t"], obs["zone"]
+        pos = me["pos"]
+        for kind, items in (("cube", obs["cubes"]), ("weapon", obs["pickups"]),
+                            ("crate", obs["crates"]), ("npc", (m for m in obs["mechs"] if m["kind"] == "npc"))):
+            for item in items:
+                self.known_loot[item["id"]] = t, kind, item
+        if t - self.loot_clock < 0.6 and self.loot_plan:
+            cost, item_id, point = self.loot_plan
+            if cost < 108 and distance(pos, point) > 3 and t - self.known_loot[item_id][0] < 3.5:
+                return point
+        self.loot_clock = t
+        self.known_loot = {i: row for i, row in self.known_loot.items()
+                           if t - row[0] <= 7 and (t - row[0] <= self.dt or distance(row[2]["pos"], pos) > 5)}
+        armed = {w["kind"] for w in me["weapons"] if w}
+        candidates = []
+        for item_id, (last, kind, item) in self.known_loot.items():
+            point = item["pos"]
+            d = distance(pos, point)
+            if d > 170 or abs(point[2] - pos[2]) > 5.5:
+                continue
+            cost = d + self.zone_cost(point, zone, t) + (t - last) * 2.5
+            if kind == "cube":
+                cluster = sum(1 for _, peer_kind, peer in self.known_loot.values()
+                              if peer_kind == "cube" and distance(point, peer["pos"]) < 9)
+                cost -= min(6, cluster) * (21 if me["cubes"] < 10 else 7)
+                if not safe_to_farm and d > (42 if cluster >= 3 else 14):
+                    continue
+            elif kind == "weapon":
+                weapon = item["kind"]
+                if weapon in armed or weapon == "gun" or "laser" in armed:
+                    continue
+                cost -= 54 if weapon == "laser" else 27
+                if not safe_to_farm and d > 24:
+                    continue
+            elif not safe_to_farm or me["cubes"] >= 8:
+                continue
+            else:
+                cost += (16 if kind == "crate" else -18) + item["hp"] * 0.05
+                if not self.arena.visible((*pos[:2], pos[2] + me["stats"]["muzzle_height"]),
+                                          (*point[:2], point[2] + 1.6), stride=3.4):
+                    cost += 19
+                point = toward(point, pos, min(d, 22 if kind == "npc" else 13))
+            for enemy in threats:
+                r = distance(enemy["pos"], point)
+                cost += max(0, 115 - r) * 1.2
+            candidates.append((cost, item_id, point))
+        self.loot_plan = min(candidates, default=None, key=lambda c: (c[0], c[1]))
+        return self.loot_plan[2] if self.loot_plan and self.loot_plan[0] < 108 else None
 
     def drop_goal(self, obs, threats):
         me, t = obs["self"], obs["t"]
@@ -724,8 +800,18 @@ class Bot:
         if rival_target and len(danger) <= 1 and rival_target.get("hp", 1400) < min(315, me["hp"] * 0.42):
             retreat = False
 
-        take, loot_goal = self.loot(obs, safe_to_farm=not danger and not retreat)
+        laser_threat = any("laser" in e["weapons"] and (
+            e["charging"] or angle_error(e["aim"][0], bearing(e["pos"], pos)) < 0.60) for e in danger)
+        if laser_threat:
+            self.mortar_cooloff = t + 4
+        take, _ = self.loot(obs, safe_to_farm=False)
         action.update(take)
+        if laser_threat and "take" not in take:
+            mortar_slot = next((i for i, w in enumerate(me["weapons"]) if w and w["kind"] == "mortar"), None)
+            if mortar_slot is not None:
+                action["drop"] = mortar_slot
+        safe_to_farm = not danger and not near and frac > 0.62
+        loot_goal = self.harvest(obs, known_threats, safe_to_farm)
         center = zone["next_center"]
         zone_goal = self.zone_goal(pos, zone)
         current_margin = zone["radius"] - distance(pos, zone["center"])
@@ -746,13 +832,13 @@ class Bot:
 
         if urgent:
             strategic = zone_goal
-        elif avoid_duels and (known_threats or loot_goal is None or me["cubes"] >= 10):
-            strategic = self.shelter_goal(obs, known_threats, radius, height)
-        elif drop is not None and (not near or frac < 0.8):
+        elif drop is not None and not near and (frac < 0.83 or me["cubes"] < 10):
             strategic = drop
+        elif avoid_duels and (not safe_to_farm or loot_goal is None or me["cubes"] >= 10):
+            strategic = self.shelter_goal(obs, known_threats, radius, height)
         elif ambush is not None and distance(pos, ambush) > 4:
             strategic = ambush
-        elif loot_goal is not None and (not retreat or distance(pos, loot_goal) < 15):
+        elif loot_goal is not None and (safe_to_farm or distance(pos, loot_goal) < 17):
             strategic = loot_goal
         elif zone["radius"] <= 65 or (next_margin < 14 and t > zone["shrink_start"] - 12):
             strategic = toward(zone_goal, center, min(15, distance(zone_goal, center)))
@@ -825,7 +911,7 @@ class Bot:
         if avoid_duels and retreat and (target is None or target.get("hp", 1400) > 310):
             aim, fire = None, [False, False]
         else:
-            aim, fire = self.combat(me, target, muzzle, retreat)
+            aim, fire = self.combat(me, target, muzzle, retreat and obs["alive"] > 2)
         if aim is None:
             if self.damage_bearing is not None and t - self.damage_time < 1.4:
                 aim = [self.damage_bearing, 0]
@@ -837,7 +923,7 @@ class Bot:
             else:
                 aim = [me["aim"][0] + self.dt * 1.9, 0]
         heard = self.listen(obs, target)
-        if heard is not None and t - self.damage_time > 0.55:
+        if heard is not None and t - self.damage_time > 0.55 and (target is None or retreat):
             aim, fire = [heard, 0], [False, False]
         guard = self.rear_guard(obs, target, aim)
         if guard is not None:
