@@ -65,6 +65,13 @@ class Bot:
         self.damage_bearing = None
         self.firing_time = -100
         self.target_id = None
+        self.ffa = False
+        self.alive_seen = None
+        self.other_losses = 0
+        self.peer_hp = {}
+        self.foreign_beams = set()
+        self.peer_wounded = {}
+        self.busy_peers = set()
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -90,6 +97,73 @@ class Bot:
             return self.config["mech"]["radius"] * factor, self.config["mech"]["height"] * factor
         stats = self.config["npc" if actor["kind"] == "npc" else "crates"]
         return stats["radius"], stats["height"]
+
+    def observe_opponents(self, obs, enemies):
+        if self.config["match"]["mechs"] <= 2:
+            return
+        t = obs["t"]
+        alive = obs["alive"]
+        if not self.ffa and t < 58 and self.alive_seen is not None:
+            kills = sum(event["type"] == "kill" for event in obs["events"])
+            self.other_losses += max(0, self.alive_seen - alive - kills)
+        self.alive_seen = alive
+        hp = {enemy["id"]: enemy["hp"] for enemy in enemies if "hp" in enemy}
+        hit_by_me = {}
+        for event in obs["events"]:
+            if event["type"] == "hit":
+                target_id = event["target"]
+                hit_by_me[target_id] = hit_by_me.get(target_id, 0) + event["amount"]
+        wounded = [
+            enemy for enemy in enemies if enemy["id"] in hp and
+            self.peer_hp.get(enemy["id"], 0) - hp[enemy["id"]] - hit_by_me.get(enemy["id"], 0) >= 35
+        ]
+        self.peer_hp = hp
+        for enemy in wounded:
+            self.peer_wounded[enemy["id"]] = t
+        if not self.ffa:
+            for beam in obs.get("beams", ()):
+                if beam["path"] and any(e["id"] != beam["by"] and distance(e["pos"], beam["path"][-1]) < 5
+                                        for e in wounded):
+                    self.foreign_beams.add(beam["by"])
+            self.ffa = self.other_losses >= 2 or len(self.foreign_beams) >= 2
+        self.busy_peers.clear()
+        if not self.ffa or alive <= 3:
+            return
+        for i, enemy in enumerate(enemies):
+            for peer in enemies[i + 1:]:
+                if distance(enemy["pos"], peer["pos"]) > 145:
+                    continue
+                yaw = bearing(enemy["pos"], peer["pos"])
+                if (angle_error(enemy["aim"][0], yaw) < 0.23 and
+                        angle_error(peer["aim"][0], yaw + pi) < 0.23):
+                    self.busy_peers.update((enemy["id"], peer["id"]))
+
+    def opportunity(self, obs, enemy, d):
+        if not self.ffa or obs["alive"] <= 3 or d > 160:
+            return 0
+        enemy_id = enemy["id"]
+        hp = enemy.get("hp", 1400)
+        if hp < 325:
+            return 38
+        me = obs["self"]
+        if angle_error(enemy["aim"][0], bearing(enemy["pos"], me["pos"])) < 0.7:
+            return 0
+        wounded = obs["t"] - self.peer_wounded.get(enemy_id, -100) < 3
+        if (wounded or enemy_id in self.busy_peers) and hp < min(950, me["hp"] * 1.1):
+            return 25 + (15 if wounded else 0)
+        return 0
+
+    def take_fight(self, obs, enemy, d):
+        if not self.ffa or obs["alive"] <= 3:
+            return True
+        me, t = obs["self"], obs["t"]
+        if d < 37 or t - self.last_damage.get(enemy["id"], -100) < 4.0:
+            return True
+        toward_me = angle_error(enemy["aim"][0], bearing(enemy["pos"], me["pos"])) < 0.35
+        hp = enemy.get("hp", 1400)
+        if self.opportunity(obs, enemy, d) and me["hp"] > 310:
+            return True
+        return toward_me and d < 92 and me["hp"] > hp * 1.18
 
     def target(self, obs, actors, muzzle):
         me = obs["self"]
@@ -117,10 +191,12 @@ class Bot:
                     score -= 24
                 if d < 42:
                     score -= 30
-            visible.append((score, actor["id"], actor))
-        chosen = min(visible)[2] if visible else None
+                score -= self.opportunity(obs, actor, d)
+            eligible = actor["kind"] != "mech" or self.take_fight(obs, actor, d)
+            visible.append((score, actor["id"], actor, eligible))
+        chosen = min((v for v in visible if v[3]), default=(0, 0, None, False))[2]
         self.target_id = chosen["id"] if chosen else None
-        return chosen, [actor for _, _, actor in visible if actor["kind"] == "mech"]
+        return chosen, [actor for _, _, actor, _ in visible if actor["kind"] == "mech"]
 
     def shot(self, weapon, target, muzzle, barrel=3):
         stats = weapon["stats"]
@@ -428,6 +504,7 @@ class Bot:
 
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: distance(pos, e["pos"]))
+        self.observe_opponents(obs, enemies)
         actors = enemies + [e for e in obs["mechs"] if e["kind"] == "npc"]
         actors += [dict(crate, kind="crate") for crate in obs["crates"]]
         target, exposed = self.target(obs, actors, muzzle)
@@ -440,6 +517,8 @@ class Bot:
         frac = me["hp"] / me["max_hp"]
         retreat = (frac < 0.43 or (frac < 0.67 and len(near) >= 2) or
                    (frac < 0.74 and t - self.damage_time > 1.9 and t - self.firing_time > 1.9))
+        if self.ffa and obs["alive"] > 3 and not (target and target["kind"] == "mech") and near:
+            retreat = True
         if len(near) == 1 and near[0].get("hp", 1400) < min(270, me["hp"] * 0.48):
             retreat = False
 
@@ -451,11 +530,24 @@ class Bot:
         next_margin = zone["next_radius"] - distance(pos, center)
         urgent = not me["in_zone"] or (current_margin < 19 and next_margin < 8 and t >= zone["shrink_start"] - 2)
         drop = self.drop_goal(obs, known_threats)
+        ambush = None
+        if not retreat and (target is None or target["kind"] != "mech"):
+            opportunities = []
+            for enemy in known_threats:
+                enemy_distance = distance(pos, enemy["pos"])
+                reward = self.opportunity(obs, enemy, enemy_distance)
+                if reward:
+                    opportunities.append((enemy_distance - reward, enemy["id"], enemy))
+            if opportunities:
+                _, _, prey = min(opportunities)
+                ambush = toward(prey["pos"], pos, min(87, distance(pos, prey["pos"])))
 
         if urgent:
             strategic = zone_goal
         elif drop is not None and (not near or frac < 0.8):
             strategic = drop
+        elif ambush is not None and distance(pos, ambush) > 4:
+            strategic = ambush
         elif loot_goal is not None and not near and not retreat:
             strategic = loot_goal
         elif zone["radius"] <= 65 or (next_margin < 14 and t > zone["shrink_start"] - 12):
