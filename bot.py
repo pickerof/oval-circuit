@@ -10,8 +10,8 @@ import mechfight
 
 WEAPON_VALUE = {"gun": 0, "mortar": 1, "lightning": 2, "laser": 3}
 UPGRADE_VALUE = {
-    "nanites": 10, "servos": 9, "gun_mag": 8.5, "gun_damage": 8,
-    "plating": 7.5, "armor": 7, "laser_damage": 6.8, "laser_charge": 6.5,
+    "nanites": 12.5, "servos": 9, "gun_mag": 8.5, "gun_damage": 8,
+    "plating": 9.5, "armor": 8.8, "laser_damage": 6.8, "laser_charge": 6.5,
     "gun_rate": 6, "reactor": 5.5, "lightning_range": 5,
     "gun_velocity": 4.5, "jets": 4, "capacitor": 3.5, "sensors": 3,
     "gyros": 2.5, "lightning_efficiency": 2, "mortar_reload": 1.5,
@@ -77,6 +77,8 @@ class Bot:
         self.busy_peers = set()
         self.motion = {}
         self.acceleration = {}
+        self.disengage_until = -100
+        self.sprint_reserve = False
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -170,28 +172,43 @@ class Bot:
             return True
         return toward_me and d < 92 and me["hp"] > hp * 1.18
 
-    def rear_guard(self, obs, target, aim):
-        """Face the biggest immediate threat when another target would expose our rear."""
-        t = obs["t"]
-        while self.recent_fire and t - self.recent_fire[0][0] > 1.35:
+    def rear_guard(self, obs, threats, target, aim, fire):
+        """Choose a front armor angle when an aim command would expose our rear."""
+        t, me = obs["t"], obs["self"]
+        while self.recent_fire and t - self.recent_fire[0][0] > 1.45:
             self.recent_fire.popleft()
-        incoming = {}
+        pressure = {}
         for time, attacker, yaw, amount in self.recent_fire:
-            weight = amount * max(0, 1 - (t - time) / 1.35)
-            old = incoming.get(attacker, (0, yaw))
-            incoming[attacker] = old[0] + weight, yaw
-        if not incoming:
+            old, _ = pressure.get(attacker, (0, yaw))
+            pressure[attacker] = old + amount * (1 - (t - time) / 1.45), yaw
+        for enemy in threats:
+            d = distance(me["pos"], enemy["pos"])
+            if d > 170:
+                continue
+            toward_me = bearing(enemy["pos"], me["pos"])
+            if angle_error(enemy["aim"][0], toward_me) > 0.45:
+                continue
+            yaw = bearing(me["pos"], enemy["pos"])
+            old, _ = pressure.get(enemy["id"], (0, yaw))
+            danger = max(5, 145 - d) * 0.45
+            if enemy["charging"]:
+                danger += 105
+            pressure[enemy["id"]] = (old + danger, yaw)
+
+        requested = aim[0]
+        danger = sum(weight for weight, yaw in pressure.values() if angle_error(yaw, requested) > 1.35)
+        if danger < (130 if any(fire) else 35):
             return None
-        attacker = max(incoming, key=lambda i: incoming[i][0])
-        damage, yaw = incoming[attacker]
-        if target and attacker == target["id"]:
+        if target and target["kind"] == "mech" and target.get("hp", 1400) < min(260, me["hp"] * 0.4):
             return None
-        target_pressure = incoming.get(target["id"], (0, 0))[0] if target else 0
-        if damage < max(55, target_pressure * 1.45):
-            return None
-        if aim is not None and angle_error(yaw, aim[0]) < 1.23:
-            return None
-        return yaw
+
+        candidates = [requested, me["aim"][0]]
+        for _, angle in pressure.values():
+            candidates.extend((angle, angle - 1.27, angle + 1.27))
+        cost = lambda a: sum(w for w, yaw in pressure.values() if angle_error(a, yaw) > 1.36) + (
+            16 * angle_error(a, requested) + 13 * angle_error(a, me["aim"][0]))
+        guard = min(candidates, key=cost)
+        return guard if angle_error(requested, guard) > 0.06 else None
 
     def listen(self, obs, target):
         t, me = obs["t"], obs["self"]
@@ -622,8 +639,11 @@ class Bot:
         exposed.sort(key=lambda e: distance(pos, e["pos"]))
         near = [e for e in exposed if distance(pos, e["pos"]) < 115]
         frac = me["hp"] / me["max_hp"]
-        retreat = (frac < 0.43 or (frac < 0.67 and len(near) >= 2) or
-                   (frac < 0.74 and t - self.damage_time > 1.9 and t - self.firing_time > 1.9))
+        damage_window = sum(damage for time, _, _, damage in self.recent_fire if t - time <= 1.25)
+        if damage_window > me["max_hp"] * 0.15 and (len(near) >= 2 or frac < 0.67):
+            self.disengage_until = t + 2.1
+        retreat = (t < self.disengage_until or frac < 0.44 or (frac < 0.70 and len(near) >= 2) or
+                   (frac < 0.79 and t - self.damage_time > 1.9 and t - self.firing_time > 1.9))
         if self.ffa and obs["alive"] > 3 and not (target and target["kind"] == "mech") and near:
             retreat = True
         if len(near) == 1 and near[0].get("hp", 1400) < min(270, me["hp"] * 0.48):
@@ -708,13 +728,15 @@ class Bot:
         climb = (escape is not None and self.force_climb) or self.stuck >= 5 or (not me["grounded"] and d > 4 and
                                     not self.arena.walk_line(pos, waypoint, radius, height))
         sprint = d > 5 and (urgent or retreat or (not exposed and distance(pos, strategic) > 100))
+        threshold = (14 if self.sprint_reserve else 39) if urgent or retreat else (34 if self.sprint_reserve else 72)
+        self.sprint_reserve = bool(sprint and me["grounded"] and me["energy"] > threshold)
         if escape is not None and self.force_climb and me["grounded"] and me["energy"] <= 28:
-            sprint = False
+            self.sprint_reserve = False
         jump = bool(me["grounded"] and climb and me["energy"] > 28)
         action["move"] = movement
         action["jump"] = jump
         action["boost"] = bool((climb and not me["grounded"] and me["energy"] > 14) or
-                               (sprint and me["grounded"] and me["energy"] > (12 if urgent else 42)))
+                               self.sprint_reserve)
         if self.zone_escape is not None:
             jump = me["grounded"] and me["energy"] >= 54
             self.zone_jumped |= bool(jump)
@@ -724,7 +746,7 @@ class Bot:
             action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
         fight_while_withdrawing = bool(retreat and target and target["kind"] == "mech" and
-                                      len(near) == 1 and target["id"] == near[0]["id"])
+                                      (obs["alive"] == 2 or (len(near) == 1 and target["id"] == near[0]["id"])))
         if retreat and target and not fight_while_withdrawing and (
                 target["kind"] != "mech" or (distance(pos, target["pos"]) > 42 and frac < 0.55)):
             target = None
@@ -740,9 +762,9 @@ class Bot:
             else:
                 aim = [me["aim"][0] + self.dt * 1.9, 0]
         heard = self.listen(obs, target)
-        if heard is not None and t - self.damage_time > 0.55:
+        if heard is not None and t - self.damage_time > 0.55 and not target:
             aim, fire = [heard, 0], [False, False]
-        guard = self.rear_guard(obs, target, aim)
+        guard = self.rear_guard(obs, exposed, target, aim, fire)
         if guard is not None:
             aim = [guard, 0]
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0)) for w in me["weapons"]]
