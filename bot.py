@@ -38,6 +38,10 @@ def toward(a, b, length):
             a[1] + (b[1] - a[1]) * length / d)
 
 
+def enemy_richer(enemy, me):
+    return enemy.get("hp", 1400) > me["hp"] * 1.45 and enemy["cubes"] > me["cubes"] + 3
+
+
 class Bot:
     name = "Bing Shing"
 
@@ -93,6 +97,9 @@ class Bot:
         self.search_time = -100
         self.search_history = deque(maxlen=9)
         self.sprinting = False
+        self.trade_window = deque()
+        self.incoming = 0.0
+        self.outgoing = 0.0
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -177,12 +184,14 @@ class Bot:
     def take_fight(self, obs, enemy, d):
         me = obs["self"]
         hp = enemy.get("hp", 1400)
-        if obs["alive"] <= 2 or obs["zone"]["radius"] < 31 or d < 24:
+        if obs["alive"] <= 2 or d < 36 or hp < min(420, me["hp"] * 0.5):
             return True
-        if hp < min(300, me["hp"] * 0.4):
+        if obs["t"] - self.last_damage.get(enemy["id"], -100) < 3.4:
             return True
-        behind = angle_error(enemy["aim"][0], bearing(enemy["pos"], me["pos"])) > 1.65
-        return self.opportunity(obs, enemy, d) and behind and me["hp"] > hp * 1.7
+        if d < 150 and enemy.get("charging") and me["hp"] >= hp * 0.88:
+            return True
+        behind = angle_error(enemy["aim"][0], bearing(enemy["pos"], me["pos"])) > 1.3
+        return d < 126 and me["hp"] > hp * (0.83 if behind else 1.05)
 
     def rear_guard(self, obs, target, aim):
         """Face the biggest immediate threat when another target would expose our rear."""
@@ -289,7 +298,9 @@ class Bot:
                 if actor.get("charging"):
                     score -= 18
                 if obs["t"] - self.last_damage.get(actor["id"], -100) < 4:
-                    score -= 58
+                    score -= 68
+                if d < 120 and actor.get("hp", 1400) < 500:
+                    score -= 48
                 elif d > 85:
                     score -= 24
                 if d < 42:
@@ -735,10 +746,11 @@ class Bot:
                 else:
                     own_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
                     hostile_lightning = "lightning" in enemy["weapons"]
-                    ideal = 32 if own_lightning and not hostile_lightning else 96
+                    own_laser = any(w and w["kind"] == "laser" for w in me["weapons"])
+                    ideal = 30 if own_lightning and not hostile_lightning else (111 if own_laser else 72)
                     score += max(0, ideal - d) * 0.9 + max(0, d - ideal - 8) * 0.5
                     if pressure:
-                        score -= 13
+                        score -= 20 if self.outgoing >= self.incoming else 12
                         if enemy.get("charging") and facing:
                             side = abs(sin(bearing(p, point) - bearing(p, pos))) * d
                             score += max(0, 11 - side) * 3
@@ -843,8 +855,16 @@ class Bot:
                     attacker = event.get("by")
                     if isinstance(attacker, int) and 0 <= attacker < self.config["match"]["mechs"]:
                         self.recent_fire.append((t, attacker, event["bearing"], event["amount"]))
+                        self.trade_window.append((t, event["amount"], 0))
             elif event["type"] == "hit":
                 self.firing_time = t
+                if isinstance(event["target"], int) and event["target"] < self.config["match"]["mechs"]:
+                    self.trade_window.append((t, 0, event["amount"]))
+
+        while self.trade_window and t - self.trade_window[0][0] > 2.8:
+            self.trade_window.popleft()
+        self.incoming = sum(taken for _, taken, _ in self.trade_window)
+        self.outgoing = sum(dealt for _, _, dealt in self.trade_window)
 
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: distance(pos, e["pos"]))
@@ -866,30 +886,22 @@ class Bot:
         danger = [e for e in exposed if distance(pos, e["pos"]) < 160 and
                   (angle_error(e["aim"][0], bearing(e["pos"], pos)) < 1.05 or
                    distance(pos, e["pos"]) < 55 or t - self.last_damage.get(e["id"], -100) < 2)]
-        if danger and (frac < 0.70 or len(danger) >= 2):
-            self.withdraw_until = t + 4
-        elif frac < 0.82 and t - self.damage_time < 1.2:
-            self.withdraw_until = max(t + 2, self.withdraw_until)
-        if rival_target and danger and obs["alive"] > 3:
-            enemy_hp = rival_target.get("hp", me["max_hp"])
-            armed = len(rival_target["weapons"]) <= sum(w is not None for w in me["weapons"])
-            if not armed or enemy_hp * 1.23 > me["hp"] or rival_target["cubes"] > me["cubes"] + 3:
-                self.withdraw_until = max(t + 1.3, self.withdraw_until)
-        avoid_duels = obs["alive"] > 2 and zone["radius"] >= 31
-        retreat = (t < self.withdraw_until or bool(known_threats and not rival_target) or
-                   bool(avoid_duels and rival_target and rival_target.get("hp", 1400) > 310))
-        if rival_target and not avoid_duels and me["in_zone"]:
-            enemy_hp = rival_target.get("hp", 1400)
-            vulnerable = frac < 0.80 and me["hp"] < enemy_hp * 0.78
-            self_arc = any(w and w["kind"] == "lightning" for w in me["weapons"])
-            outranged = ("laser" in rival_target["weapons"] and
-                         not any(w and w["kind"] == "laser" for w in me["weapons"]))
-            if vulnerable or (outranged and not self_arc and me["hp"] < enemy_hp * 0.99):
-                retreat = True
+        if danger and (len(danger) >= 3 or (self.incoming > max(290, self.outgoing * 1.45) and frac < 0.73)):
+            self.withdraw_until = t + 3.5
+        elif frac < 0.48 and t - self.damage_time < 1.8:
+            self.withdraw_until = max(t + 2.7, self.withdraw_until)
+        avoid_duels = obs["alive"] > 2 and zone["radius"] >= 36
+        retreat = t < self.withdraw_until
+        if known_threats and not rival_target:
+            retreat = retreat or len(known_threats) > 1 or frac < 0.82
+        if rival_target and frac < 0.60 and enemy_richer(rival_target, me):
+            retreat = True
         if rival_target and len(danger) <= 1 and rival_target.get("hp", 1400) < min(315, me["hp"] * 0.42):
             retreat = False
 
-        laser_threat = any("laser" in e["weapons"] and distance(pos, e["pos"]) < 178 for e in known_threats)
+        laser_threat = any("laser" in e["weapons"] and distance(pos, e["pos"]) < 155 and
+                           (e["charging"] or angle_error(e["aim"][0], bearing(e["pos"], pos)) < 0.5)
+                           for e in danger)
         if laser_threat:
             self.mortar_cooloff = t + 4
         take, _ = self.loot(obs, safe_to_farm=False)
@@ -933,8 +945,7 @@ class Bot:
                 strategic, roof_climb = self.roof_approach(me, loot_goal, radius, height)
         elif avoid_duels and safe_to_farm and me["weapons"].count(None) and loot_goal is None:
             strategic = self.search(obs, known_threats, radius, height)
-        elif (avoid_duels or (retreat and known_threats)) and (
-                not safe_to_farm or loot_goal is None or me["cubes"] >= 10):
+        elif retreat and known_threats:
             strategic = self.shelter_goal(obs, known_threats, radius, height)
         elif ambush is not None and distance(pos, ambush) > 4:
             strategic = ambush
@@ -944,7 +955,8 @@ class Bot:
             strategic = toward(zone_goal, center, min(15, distance(zone_goal, center)))
         elif target and target["kind"] == "mech" and not retreat:
             p = target["pos"]
-            strategic = toward(pos, p, min(35, max(0, distance(pos, p) - 96)))
+            standoff = 80 if me["weapons"].count(None) else 100
+            strategic = toward(pos, p, min(35, max(0, distance(pos, p) - standoff)))
         else:
             # Stay inside the next ring while looking for loot along its interior.
             phase = t / 14 + me["id"]
@@ -1025,10 +1037,7 @@ class Bot:
         if retreat and (target is None or target["kind"] != "mech") and danger:
             target = danger[0]
         point_blank = bool(target and target["kind"] == "mech" and distance(pos, target["pos"]) < 44)
-        if avoid_duels and retreat and not point_blank and (target is None or target.get("hp", 1400) > 310):
-            aim, fire = None, [False, False]
-        else:
-            aim, fire = self.combat(me, target, muzzle, retreat and not point_blank)
+        aim, fire = self.combat(me, target, muzzle, retreat and not point_blank)
         if target and target["kind"] == "mech" or danger or t - self.damage_time < 1.0:
             self.scout_start = None
         if (not target and not danger and t - self.damage_time > 1.0 and me["weapons"].count(None) and
