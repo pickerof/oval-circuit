@@ -10,8 +10,8 @@ import mechfight
 
 WEAPON_VALUE = {"gun": 0, "mortar": 1, "lightning": 2, "laser": 3}
 UPGRADE_VALUE = {
-    "nanites": 10, "servos": 9, "gun_mag": 8.5, "gun_damage": 8,
-    "plating": 7.5, "armor": 7, "laser_damage": 6.8, "laser_charge": 6.5,
+    "nanites": 14, "servos": 9, "gun_mag": 8.5, "gun_damage": 8,
+    "plating": 10, "armor": 9.5, "laser_damage": 6.8, "laser_charge": 6.5,
     "gun_rate": 6, "reactor": 5.5, "lightning_range": 5,
     "gun_velocity": 4.5, "jets": 4, "capacitor": 3.5, "sensors": 3,
     "gyros": 2.5, "lightning_efficiency": 2, "mortar_reload": 1.5,
@@ -77,6 +77,8 @@ class Bot:
         self.busy_peers = set()
         self.motion = {}
         self.acceleration = {}
+        self.enemy_memory = {}
+        self.withdraw_until = -100
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -262,9 +264,11 @@ class Bot:
             _, height = self.shape(actor)
             point = (*actor["pos"][:2], actor["pos"][2] + height * 0.57)
             if not self.arena.visible(muzzle, point):
-                continue
+                high = (*point[:2], actor["pos"][2] + height * 0.82)
+                if actor["kind"] != "mech" or not self.arena.visible(muzzle, high):
+                    continue
             score = d + actor.get("hp", 1400) * 0.035
-            score += {"mech": -65, "npc": 4, "crate": 0}[actor["kind"]]
+            score += {"mech": -65, "npc": -26, "crate": 0}[actor["kind"]]
             if actor["id"] == self.target_id:
                 score -= 13
             if actor["kind"] == "mech":
@@ -383,7 +387,7 @@ class Bot:
                           abs(sp - me["aim"][1]) < tilt + height * 0.35 / max(1, d))))
             if kind == "laser":
                 charge = weapon.get("charge", 0)
-                if retreat:
+                if retreat and not charge:
                     continue
                 if charge:
                     fire[index] = (charge < state["charge"] - self.dt * 0.25 or not lined_up)
@@ -418,25 +422,25 @@ class Bot:
                     take = {"take": pickup["id"], "value": WEAPON_VALUE[kind]}
                     if swap is not None:
                         take["drop"] = swap
-            if dz < 6 and d < (125 if kind == "laser" else 85):
+            if dz < 6 and d < (100 if kind == "laser" else 72):
                 candidates.append((d - 18 * WEAPON_VALUE[kind], pickup["id"], p))
         take.pop("value", None)
-        if safe_to_farm:
+        if safe_to_farm or me["cubes"] < 10:
             for cube in obs["cubes"]:
                 d = distance(pos, cube["pos"])
-                if abs(pos[2] - cube["pos"][2]) < 5 and d < 115:
+                if abs(pos[2] - cube["pos"][2]) < 5 and d < (115 if safe_to_farm else 18):
                     candidates.append((d - (58 if me["cubes"] < 10 else 12), cube["id"], cube["pos"]))
-            for crate in obs["crates"]:
+            for crate in obs["crates"] if safe_to_farm else ():
                 d = distance(pos, crate["pos"])
                 if abs(pos[2] - crate["pos"][2]) < 5 and d < 115:
                     approach = toward(crate["pos"], pos, min(d, 18))
                     candidates.append((d + crate["hp"] * 0.08, crate["id"], approach))
-            for actor in obs["mechs"]:
+            for actor in obs["mechs"] if safe_to_farm else ():
                 if actor["kind"] == "npc" and distance(pos, actor["pos"]) < 105:
                     d = distance(pos, actor["pos"])
                     if abs(pos[2] - actor["pos"][2]) < 5:
                         approach = toward(actor["pos"], pos, min(d, 35))
-                        candidates.append((d - 8, actor["id"], approach))
+                        candidates.append((d - 37, actor["id"], approach))
         zone, t = obs["zone"], obs["t"]
         if candidates:
             candidates = [(score + self.zone_cost(p, zone, t), i, p) for score, i, p in candidates]
@@ -461,53 +465,65 @@ class Bot:
                 best = value, p
         return best[1] if best else None
 
-    def tactical(self, obs, strategic, threats, retreat, target, radius, height):
-        t, me = obs["t"], obs["self"]
+    def cover_move(self, obs, strategic, threats, retreat, target, radius, height):
+        t, me, zone = obs["t"], obs["self"], obs["zone"]
         pos = me["pos"]
         if not threats:
             self.tactical_goal = None
             return strategic
-        if self.tactical_goal and t - self.tactical_time < 0.28 and distance(pos, self.tactical_goal) > 4:
-            return self.tactical_goal
-        closest = min(threats, key=lambda e: distance(pos, e["pos"]))
-        direction = bearing(closest["pos"], pos)
-        ideal = 35 if any(w and w["kind"] == "lightning" for w in me["weapons"]) else 103
-        if retreat:
-            ideal = 105
-        options = [strategic]
-        for i in range(12):
-            yaw = direction + i * pi / 6
-            options.append((pos[0] + 19 * cos(yaw), pos[1] + 19 * sin(yaw)))
-        ranked = []
-        target_id = target["id"] if target and target["kind"] == "mech" else None
+        if self.tactical_goal is not None and t - self.tactical_time < 0.27:
+            if distance(pos, self.tactical_goal) > 3:
+                return self.tactical_goal
+
+        target_id = target["id"] if target else None
+        closest = threats[0]
+        away = bearing(closest["pos"], pos)
+        endpoint = toward(pos, strategic, min(18, distance(pos, strategic)))
+        options = [endpoint, tuple(pos[:2])]
+        for offset in range(12):
+            yaw = away + offset * pi / 6
+            options.append((pos[0] + 18 * cos(yaw), pos[1] + 18 * sin(yaw)))
+        peers = []
+        for enemy in threats:
+            p = enemy["pos"]
+            eye = (*p[:2], p[2] + self.shape(enemy)[1] * 0.7)
+            last = self.enemy_memory.get(enemy["id"], (t, enemy))[0]
+            peers.append((enemy, p, eye, max(0.35, 1 - (t - last) * 0.22)))
+
+        best = None
+        dx, dy = me["vel"][:2]
         for point in options:
-            endpoint = toward(pos, point, min(20, distance(pos, point)))
-            if distance(pos, endpoint) < 1 or not self.arena.walk_line(pos, endpoint, radius, height):
+            if point != tuple(pos[:2]) and not self.arena.walk_line(pos, point, radius, height):
                 continue
-            score = self.zone_cost(endpoint, obs["zone"], t)
-            score += (distance(endpoint, strategic) - distance(pos, strategic)) * 0.36
-            for i, enemy in enumerate(threats[:4]):
-                enemy_pos = enemy["pos"]
-                d = distance(endpoint, enemy_pos)
-                if retreat:
-                    score += max(0, ideal - d) * (0.85 if i == 0 else 0.45)
+            z = self.arena.support(*point, pos[2] + 1.2)
+            eye = (*point, z + height * 0.72)
+            score = self.zone_cost(point, zone, t)
+            score += 0.55 * (distance(point, strategic) - distance(pos, strategic))
+            score -= 0.015 * (dx * (point[0] - pos[0]) + dy * (point[1] - pos[1]))
+            for enemy, p, other, confidence in peers:
+                d = distance(p, point)
+                facing = angle_error(enemy["aim"][0], bearing(p, point)) < 0.9
+                pressure = self.arena.visible(eye, other, stride=3.5) if d < 190 else False
+                if retreat or enemy["id"] != target_id:
+                    value = max(0, 91 - d) * 0.72 + max(0, 42 - d) * 1.5
+                    if pressure:
+                        value += max(0, 180 - d) * (0.33 if facing else 0.21)
+                        if "lightning" in enemy["weapons"]:
+                            value += max(0, 64 - d) * 1.5
+                    score += value * confidence
                 else:
-                    score += max(0, ideal - d) * 1.15 + max(0, d - ideal - 12) * (0.48 if i == 0 else 0)
-                if d < 142:
-                    eye = (*endpoint, self.arena.ground(*endpoint) + height * 0.65)
-                    other = (*enemy_pos[:2], enemy_pos[2] + self.shape(enemy)[1] * 0.75)
-                    if self.arena.visible(eye, other, stride=4):
-                        if enemy["id"] == target_id:
-                            score += 24 if retreat else -11
-                        else:
-                            aligned = angle_error(enemy["aim"][0], bearing(enemy_pos, endpoint)) < 0.9
-                            recently_hit = t - self.last_damage.get(enemy["id"], -100) < 4
-                            score += 22 if aligned or recently_hit else 10
-            # Prefer lateral motion in a duel and retain momentum on near ties.
-            score -= (me["vel"][0] * (endpoint[0] - pos[0]) +
-                      me["vel"][1] * (endpoint[1] - pos[1])) * 0.017
-            ranked.append((score, point))
-        self.tactical_goal = min(ranked)[1] if ranked else strategic
+                    own_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
+                    hostile_lightning = "lightning" in enemy["weapons"]
+                    ideal = 32 if own_lightning and not hostile_lightning else 96
+                    score += max(0, ideal - d) * 0.9 + max(0, d - ideal - 8) * 0.5
+                    if pressure:
+                        score -= 13
+                        if enemy.get("charging") and facing:
+                            side = abs(sin(bearing(p, point) - bearing(p, pos))) * d
+                            score += max(0, 11 - side) * 3
+            if best is None or score < best[0]:
+                best = score, point
+        self.tactical_goal = best[1] if best else strategic
         self.tactical_time = t
         return self.tactical_goal
 
@@ -610,26 +626,36 @@ class Bot:
 
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: distance(pos, e["pos"]))
+        for enemy in enemies:
+            self.enemy_memory[enemy["id"]] = t, enemy
+        self.enemy_memory = {i: entry for i, entry in self.enemy_memory.items() if t - entry[0] < 4.2}
         self.observe_opponents(obs, enemies)
         self.observe_motion(t, enemies)
         actors = enemies + [e for e in obs["mechs"] if e["kind"] == "npc"]
         actors += [dict(crate, kind="crate") for crate in obs["crates"]]
         target, exposed = self.target(obs, actors, muzzle)
-        known_threats = [enemy for enemy in enemies if distance(pos, enemy["pos"]) < 155]
-        if target and target["kind"] == "mech":
-            known_threats.sort(key=lambda enemy: (enemy["id"] != target["id"],
-                                                  distance(pos, enemy["pos"])))
+        known_threats = sorted(
+            (e for _, e in self.enemy_memory.values() if distance(pos, e["pos"]) < 195),
+            key=lambda e: distance(pos, e["pos"]))[:4]
         exposed.sort(key=lambda e: distance(pos, e["pos"]))
         near = [e for e in exposed if distance(pos, e["pos"]) < 115]
         frac = me["hp"] / me["max_hp"]
-        retreat = (frac < 0.43 or (frac < 0.67 and len(near) >= 2) or
-                   (frac < 0.74 and t - self.damage_time > 1.9 and t - self.firing_time > 1.9))
-        if self.ffa and obs["alive"] > 3 and not (target and target["kind"] == "mech") and near:
-            retreat = True
-        if len(near) == 1 and near[0].get("hp", 1400) < min(270, me["hp"] * 0.48):
+        rival_target = target if target and target["kind"] == "mech" else None
+        danger = [e for e in exposed if distance(pos, e["pos"]) < 160 and
+                  (angle_error(e["aim"][0], bearing(e["pos"], pos)) < 1.05 or
+                   distance(pos, e["pos"]) < 55 or t - self.last_damage.get(e["id"], -100) < 2)]
+        if danger and (frac < 0.70 or len(danger) >= 2):
+            self.withdraw_until = t + 4
+        if rival_target and danger and obs["alive"] > 3:
+            enemy_hp = rival_target.get("hp", me["max_hp"])
+            armed = len(rival_target["weapons"]) <= sum(w is not None for w in me["weapons"])
+            if not armed or enemy_hp * 1.23 > me["hp"] or rival_target["cubes"] > me["cubes"] + 3:
+                self.withdraw_until = max(t + 1.3, self.withdraw_until)
+        retreat = t < self.withdraw_until or bool(known_threats and not rival_target)
+        if rival_target and len(danger) <= 1 and rival_target.get("hp", 1400) < min(315, me["hp"] * 0.42):
             retreat = False
 
-        take, loot_goal = self.loot(obs, safe_to_farm=not near and not retreat)
+        take, loot_goal = self.loot(obs, safe_to_farm=not danger and not retreat)
         action.update(take)
         center = zone["next_center"]
         zone_goal = self.zone_goal(pos, zone)
@@ -638,7 +664,7 @@ class Bot:
         urgent = not me["in_zone"] or (current_margin < 19 and next_margin < 8 and t >= zone["shrink_start"] - 2)
         drop = self.drop_goal(obs, known_threats)
         ambush = None
-        if not retreat and (target is None or target["kind"] != "mech"):
+        if not retreat and not rival_target and me["cubes"] >= 6:
             opportunities = []
             for enemy in known_threats:
                 enemy_distance = distance(pos, enemy["pos"])
@@ -655,7 +681,7 @@ class Bot:
             strategic = drop
         elif ambush is not None and distance(pos, ambush) > 4:
             strategic = ambush
-        elif loot_goal is not None and not near and not retreat:
+        elif loot_goal is not None and (not retreat or distance(pos, loot_goal) < 15):
             strategic = loot_goal
         elif zone["radius"] <= 65 or (next_margin < 14 and t > zone["shrink_start"] - 12):
             strategic = toward(zone_goal, center, min(15, distance(zone_goal, center)))
@@ -665,12 +691,12 @@ class Bot:
         else:
             # Stay inside the next ring while looking for loot along its interior.
             phase = t / 14 + me["id"]
-            patrol_radius = zone["next_radius"] * 0.55
+            patrol_radius = zone["next_radius"] * (0.51 if me["cubes"] < 8 else 0.26)
             strategic = (center[0] + patrol_radius * cos(phase), center[1] + patrol_radius * sin(phase))
             if next_margin < 15:
                 strategic = zone_goal
 
-        if retreat and not exposed and t - self.damage_time > 0.8 and next_margin > 16 and drop is None:
+        if frac < 0.93 and not exposed and 0.9 < t - self.damage_time < 23 and next_margin > 16 and drop is None:
             strategic = pos
         if retreat and not exposed and t - self.damage_time <= 0.8 and self.damage_bearing is not None and not urgent:
             yaw = self.damage_bearing
@@ -678,7 +704,7 @@ class Bot:
         if drop is not None and strategic is drop and distance(pos, drop) <= 5:
             strategic = pos
         if known_threats and not urgent and strategic is not pos:
-            strategic = self.tactical(obs, strategic, known_threats, retreat, target, radius, height)
+            strategic = self.cover_move(obs, strategic, known_threats, retreat, rival_target, radius, height)
         if not urgent:
             self.zone_progress = None
             self.zone_escape = None
@@ -723,12 +749,9 @@ class Bot:
         if not urgent and not jump and not climb and obs["projectiles"]:
             action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
-        fight_while_withdrawing = bool(retreat and target and target["kind"] == "mech" and
-                                      len(near) == 1 and target["id"] == near[0]["id"])
-        if retreat and target and not fight_while_withdrawing and (
-                target["kind"] != "mech" or (distance(pos, target["pos"]) > 42 and frac < 0.55)):
-            target = None
-        aim, fire = self.combat(me, target, muzzle, retreat and not fight_while_withdrawing)
+        if retreat and target and target["kind"] != "mech" and danger:
+            target = danger[0]
+        aim, fire = self.combat(me, target, muzzle, retreat)
         if aim is None:
             if self.damage_bearing is not None and t - self.damage_time < 1.4:
                 aim = [self.damage_bearing, 0]

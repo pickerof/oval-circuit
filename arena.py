@@ -70,6 +70,7 @@ class Arena:
                                floor((top + self.clearance) / self.bucket) + 1):
                     self.prisms[i, j].append(item)
         self.walk_cache = {}
+        self.edge_cache = {}
 
     def ground(self, x, y):
         i = max(0, min(self.nx - 1, int((x - self.x0) / self.step + 0.5)))
@@ -160,7 +161,7 @@ class Arena:
                 return cell
         return None
 
-    def route(self, start, goal, radius, height, limit=330):
+    def route(self, start, goal, radius, height, limit=152):
         start_cell = self.nearest_open(start, radius, height, reachable_from=start)
         goal_cell = self.nearest_open(goal, radius, height, limit=8)
         if start_cell is None or goal_cell is None:
@@ -174,7 +175,9 @@ class Arena:
         costs = {start_cell: 0}
         best = start_cell
         best_distance = distance(best)
-        deadline = perf_counter() + 0.009
+        if len(self.edge_cache) > 24000:
+            self.edge_cache.clear()
+        deadline = perf_counter() + 0.026
         for expanded in range(limit):
             if not frontier or (expanded % 4 == 0 and perf_counter() >= deadline):
                 break
@@ -196,9 +199,13 @@ class Arena:
                 if dx and dy and not (self.open_cell((cell[0] + dx, cell[1]), radius, height) and
                                       self.open_cell((cell[0], cell[1] + dy), radius, height)):
                     continue
-                ax, ay = self.point(cell)
-                bx, by = self.point(neighbor)
-                if not self.walk_line((ax, ay, self.ground(ax, ay)), (bx, by), radius, height):
+                edge = (cell, neighbor, radius, height)
+                clear = self.edge_cache.get(edge)
+                if clear is None:
+                    ax, ay = self.point(cell)
+                    clear = self.walk_line((ax, ay, self.ground(ax, ay)), self.point(neighbor), radius, height)
+                    self.edge_cache[edge] = clear
+                if not clear:
                     continue
                 costs[neighbor] = new_cost
                 parents[neighbor] = cell
