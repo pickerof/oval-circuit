@@ -89,6 +89,10 @@ class Bot:
         self.mortar_cooloff = -100
         self.scout_start = None
         self.scout_time = -100
+        self.search_goal = None
+        self.search_time = -100
+        self.search_history = deque(maxlen=9)
+        self.sprinting = False
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -477,6 +481,63 @@ class Bot:
             return take, min(candidates)[2]
         return take, None
 
+    def search(self, obs, threats, radius, height):
+        me, t, zone = obs["self"], obs["t"], obs["zone"]
+        pos = me["pos"]
+        if self.search_goal is not None and t - self.search_time < 7 and distance(pos, self.search_goal) > 8:
+            return self.search_goal
+        if self.search_goal:
+            self.search_history.append(self.search_goal)
+        forward = bearing(pos, zone["next_center"])
+        best = None
+        for k in range(12):
+            angle = forward + k * pi / 6
+            point = (pos[0] + 53 * cos(angle), pos[1] + 53 * sin(angle))
+            if not self.arena.walk_line(pos, toward(pos, point, 11), radius, height):
+                continue
+            cell = self.arena.nearest_open(point, radius, height, limit=2)
+            if cell is None:
+                continue
+            point = self.arena.point(cell)
+            score = self.zone_cost(point, zone, t)
+            score += sum(max(0, 67 - distance(point, old)) * 0.7 for old in self.search_history)
+            score += 6 if not self.arena.walk_line(pos, point, radius, height) else 0
+            score += 0.10 * distance(point, zone["next_center"])
+            for enemy in threats:
+                d = distance(point, enemy["pos"])
+                score += max(0, 160 - d) * 0.6
+            if best is None or score < best[0]:
+                best = score, point
+        self.search_goal = best[1] if best else self.zone_goal(pos, zone)
+        self.search_time = t
+        return self.search_goal
+
+    def roof_approach(self, me, roof, radius, height):
+        pos = me["pos"]
+        if pos[2] >= roof[2] - 0.15:
+            return roof, False
+        d = distance(pos, roof)
+        nx, ny = toward(pos, roof, min(d, 39))
+        if d > 46 or abs(me["vel"][2]) > 2 and me["vel"][2] < 0:
+            return (nx, ny), False
+        yaw = bearing(roof, pos)
+        choices = []
+        for angle in (yaw, yaw + 0.85, yaw - 0.85):
+            for r in (7, 13, 20, 30):
+                x, y = roof[0] + r * cos(angle), roof[1] + r * sin(angle)
+                low = self.arena.ground(x, y)
+                if not self.arena.clear(x, y, low, radius, roof[2] - low + height):
+                    continue
+                if not self.arena.walk_line(pos, (x, y), radius, height) and me["grounded"]:
+                    continue
+                if not self.arena.walk_line((x, y, roof[2]), roof, radius, height):
+                    continue
+                choices.append((distance(pos, (x, y)) + r * 0.55, (x, y)))
+        if not choices:
+            return (nx, ny), False
+        approach = min(choices)[1]
+        return approach, distance(pos, approach) < (8 if not me["grounded"] else 4)
+
     def harvest(self, obs, threats, safe_to_farm):
         me, t, zone = obs["self"], obs["t"], obs["zone"]
         pos = me["pos"]
@@ -494,11 +555,16 @@ class Bot:
         self.known_loot = {i: row for i, row in self.known_loot.items()
                            if t - row[0] <= 7 and (t - row[0] <= self.dt or distance(row[2]["pos"], pos) > 5)}
         armed = {w["kind"] for w in me["weapons"] if w}
+        needs_weapon = len(armed) == 1
         candidates = []
         for item_id, (last, kind, item) in self.known_loot.items():
             point = item["pos"]
             d = distance(pos, point)
-            if d > 190 or abs(point[2] - pos[2]) > 5.5:
+            elevation = point[2] - pos[2]
+            roof_access = (
+                kind == "weapon" and needs_weapon and safe_to_farm and me["energy"] > 58 and 5 < elevation < 24
+            )
+            if d > 200 or (abs(elevation) > 5.5 and not roof_access):
                 continue
             cost = d + self.zone_cost(point, zone, t) + (t - last) * 2.5
             if kind == "cube":
@@ -511,13 +577,15 @@ class Bot:
                 weapon = item["kind"]
                 if weapon in armed or weapon == "gun" or "laser" in armed:
                     continue
-                cost -= 92 if weapon == "laser" else 48
+                cost -= (115 if weapon == "laser" else 80) if needs_weapon else (75 if weapon == "laser" else 34)
+                if roof_access:
+                    cost += 17
                 if not safe_to_farm and d > 24:
                     continue
             elif not safe_to_farm or me["cubes"] >= 8:
                 continue
             else:
-                cost += (16 if kind == "crate" else -18) + item["hp"] * 0.05
+                cost += (3 if kind == "crate" else -18) + item["hp"] * 0.05
                 if not self.arena.visible((*pos[:2], pos[2] + me["stats"]["muzzle_height"]),
                                           (*point[:2], point[2] + 1.6), stride=3.4):
                     cost += 19
@@ -839,6 +907,9 @@ class Bot:
         next_margin = zone["next_radius"] - distance(pos, center)
         urgent = not me["in_zone"] or (current_margin < 19 and next_margin < 8 and t >= zone["shrink_start"] - 2)
         drop = self.drop_goal(obs, known_threats)
+        seeking_weapon = bool(self.loot_plan and loot_goal is not None and
+                              self.known_loot[self.loot_plan[1]][1] == "weapon")
+        roof_climb = False
         ambush = None
         if not retreat and not rival_target and me["cubes"] >= 6:
             opportunities = []
@@ -855,6 +926,12 @@ class Bot:
             strategic = zone_goal
         elif drop is not None and not near and (frac < 0.83 or me["cubes"] < 10):
             strategic = drop
+        elif safe_to_farm and seeking_weapon and me["weapons"].count(None):
+            strategic = loot_goal
+            if len(loot_goal) == 3 and loot_goal[2] - pos[2] > 1.2:
+                strategic, roof_climb = self.roof_approach(me, loot_goal, radius, height)
+        elif avoid_duels and safe_to_farm and me["weapons"].count(None) and loot_goal is None:
+            strategic = self.search(obs, known_threats, radius, height)
         elif (avoid_duels or (retreat and known_threats)) and (
                 not safe_to_farm or loot_goal is None or me["cubes"] >= 10):
             strategic = self.shelter_goal(obs, known_threats, radius, height)
@@ -920,20 +997,28 @@ class Bot:
         self.location = pos
         climb = (escape is not None and self.force_climb) or self.stuck >= 5 or (not me["grounded"] and d > 4 and
                                     not self.arena.walk_line(pos, waypoint, radius, height))
-        sprint = d > 5 and (urgent or retreat or (not exposed and distance(pos, strategic) > 50))
+        sprint = d > 5 and (urgent or retreat or (not exposed and distance(pos, strategic) > 34))
+        energy_needed = 25 if self.sprinting else 68
+        if urgent or (retreat and danger):
+            energy_needed = 16 if self.sprinting else 36
+        self.sprinting = bool(sprint and me["grounded"] and me["energy"] > energy_needed)
         if escape is not None and self.force_climb and me["grounded"] and me["energy"] <= 28:
-            sprint = False
+            self.sprinting = False
         jump = bool(me["grounded"] and climb and me["energy"] > 28)
         action["move"] = movement
         action["jump"] = jump
         action["boost"] = bool((climb and not me["grounded"] and me["energy"] > 14) or
-                               (sprint and me["grounded"] and me["energy"] > (12 if urgent else 42)))
+                               self.sprinting)
+        if roof_climb:
+            action["jump"] = me["grounded"] and me["energy"] > 48
+            action["boost"] = not me["grounded"] and me["energy"] > 10
+            action["move"] = (0, 0)
         if self.zone_escape is not None:
             jump = me["grounded"] and me["energy"] >= 54
             self.zone_jumped |= bool(jump)
             action["jump"] = bool(jump)
             action["boost"] = bool(not me["grounded"] and self.zone_jumped and me["energy"] > 7)
-        if not urgent and not jump and obs["projectiles"]:
+        if not urgent and not jump and not roof_climb and obs["projectiles"]:
             action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
         if retreat and (target is None or target["kind"] != "mech") and danger:
