@@ -562,7 +562,8 @@ class Bot:
             d = distance(pos, point)
             elevation = point[2] - pos[2]
             roof_access = (
-                kind == "weapon" and needs_weapon and safe_to_farm and me["energy"] > 58 and 5 < elevation < 24
+                kind == "weapon" and needs_weapon and safe_to_farm and
+                me["energy"] > (58 if me["grounded"] else 12) and 5 < elevation < 24
             )
             if d > 200 or (abs(elevation) > 5.5 and not roof_access):
                 continue
