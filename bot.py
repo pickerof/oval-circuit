@@ -181,6 +181,22 @@ class Bot:
             return 25 + (15 if wounded else 0)
         return 0
 
+    def rear_opportunity(self, obs, enemy, distance_to_enemy):
+        me = obs["self"]
+        if not 3 <= obs["alive"] <= 9 or not 31 < distance_to_enemy < 147:
+            return 0
+        if me["hp"] < me["max_hp"] * 0.70 or enemy.get("hp", 1400) > me["hp"] * 1.35:
+            return 0
+        direction = bearing(enemy["pos"], me["pos"])
+        if angle_error(enemy["aim"][0], direction) < 1.86:
+            return 0
+        own_secondary = any(w and w["kind"] in ("laser", "lightning") for w in me["weapons"])
+        if not own_secondary and enemy.get("hp", 1400) > 650:
+            return 0
+        pressure = 12 if "laser" in enemy["weapons"] else 0
+        pressure += min(25, enemy["cubes"] * 4)
+        return 15 + pressure
+
     def take_fight(self, obs, enemy, d):
         me = obs["self"]
         hp = enemy.get("hp", 1400)
@@ -189,6 +205,8 @@ class Bot:
         if obs["t"] - self.last_damage.get(enemy["id"], -100) < 3.4:
             return True
         if d < 150 and enemy.get("charging") and me["hp"] >= hp * 0.88:
+            return True
+        if self.rear_opportunity(obs, enemy, d):
             return True
         behind = angle_error(enemy["aim"][0], bearing(enemy["pos"], me["pos"])) > 1.3
         return d < 126 and me["hp"] > hp * (0.83 if behind else 1.05)
@@ -306,6 +324,7 @@ class Bot:
                 if d < 42:
                     score -= 30
                 score -= self.opportunity(obs, actor, d)
+                score -= self.rear_opportunity(obs, actor, d)
             eligible = actor["kind"] != "mech" or self.take_fight(obs, actor, d)
             visible.append((score, actor["id"], actor, eligible))
         chosen = min((v for v in visible if v[3]), default=(0, 0, None, False))[2]
