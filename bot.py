@@ -82,6 +82,7 @@ class Bot:
         self.shelter = None
         self.shelter_time = -100
         self.shelter_costs = {}
+        self.tactical_retreat = None
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -471,7 +472,8 @@ class Bot:
         pos = me["pos"]
         center, next_radius = zone["next_center"], zone["next_radius"]
         if self.shelter is not None and t - self.shelter_time < (1.25 if threats else 4.5):
-            if distance(self.shelter, center) < next_radius - 7:
+            if distance(self.shelter, center) < next_radius - 7 and not any(
+                    distance(enemy["pos"], self.shelter) < 90 for enemy in threats):
                 return self.shelter
 
         anchor = toward(center, pos, max(0, min(distance(pos, center), next_radius - 18)))
@@ -493,7 +495,7 @@ class Bot:
             travel = distance(pos, point)
             zone_distance = distance(point, center)
             cost = self.zone_cost(point, zone, t) + max(0, zone_distance - cutoff) * 1.6
-            cost += travel * 0.37 + 0.045 * zone_distance
+            cost += travel * 0.42 + 0.055 * zone_distance
             if self.shelter is not None and distance(self.shelter, point) < 10:
                 cost -= 5
             if travel < 62 and not self.arena.walk_line(pos, point, radius, height):
@@ -513,7 +515,7 @@ class Bot:
                 p = enemy["pos"]
                 d = distance(p, point)
                 other = (*p[:2], p[2] + self.shape(enemy)[1] * 0.7)
-                cost += max(0, 91 - d) * 0.55
+                cost += max(0, 115 - d) * 0.65
                 if d < 195 and self.arena.visible(eye, other, stride=3.7):
                     cost += max(0, 195 - d) * 0.35
             if best is None or cost < best[0]:
@@ -528,7 +530,8 @@ class Bot:
         if not threats:
             self.tactical_goal = None
             return strategic
-        if self.tactical_goal is not None and t - self.tactical_time < 0.27:
+        if (self.tactical_goal is not None and retreat == self.tactical_retreat and
+                t - self.tactical_time < 0.32):
             if distance(pos, self.tactical_goal) > 3:
                 return self.tactical_goal
 
@@ -536,7 +539,9 @@ class Bot:
         closest = threats[0]
         away = bearing(closest["pos"], pos)
         endpoint = toward(pos, strategic, min(18, distance(pos, strategic)))
-        options = [endpoint, tuple(pos[:2])]
+        options = [endpoint]
+        if not retreat or not any(distance(enemy["pos"], pos) < 100 for enemy in threats):
+            options.append(tuple(pos[:2]))
         for offset in range(12):
             yaw = away + offset * pi / 6
             options.append((pos[0] + 18 * cos(yaw), pos[1] + 18 * sin(yaw)))
@@ -562,11 +567,13 @@ class Bot:
                 facing = angle_error(enemy["aim"][0], bearing(p, point)) < 0.9
                 pressure = self.arena.visible(eye, other, stride=3.5) if d < 190 else False
                 if retreat or enemy["id"] != target_id:
-                    value = max(0, 91 - d) * 0.72 + max(0, 42 - d) * 1.5
+                    value = max(0, 115 - d) * 0.84 + max(0, 55 - d) * 1.7
                     if pressure:
                         value += max(0, 180 - d) * (0.33 if facing else 0.21)
                         if "lightning" in enemy["weapons"]:
                             value += max(0, 64 - d) * 1.5
+                        lateral = abs(sin(bearing(p, point) - bearing(p, pos))) * d
+                        value += max(0, 11 - lateral) * max(0, 155 - d) / 100
                     score += value * confidence
                 else:
                     own_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
@@ -582,6 +589,7 @@ class Bot:
                 best = score, point
         self.tactical_goal = best[1] if best else strategic
         self.tactical_time = t
+        self.tactical_retreat = retreat
         return self.tactical_goal
 
     def escape(self, pos, goal, radius, height, t):
@@ -703,6 +711,8 @@ class Bot:
                    distance(pos, e["pos"]) < 55 or t - self.last_damage.get(e["id"], -100) < 2)]
         if danger and (frac < 0.70 or len(danger) >= 2):
             self.withdraw_until = t + 4
+        elif frac < 0.82 and t - self.damage_time < 1.2:
+            self.withdraw_until = max(t + 2, self.withdraw_until)
         if rival_target and danger and obs["alive"] > 3:
             enemy_hp = rival_target.get("hp", me["max_hp"])
             armed = len(rival_target["weapons"]) <= sum(w is not None for w in me["weapons"])
@@ -759,7 +769,7 @@ class Bot:
 
         if frac < 0.93 and not exposed and not known_threats and 0.9 < t - self.damage_time < 23 and next_margin > 16 and drop is None:
             strategic = pos
-        if retreat and not exposed and t - self.damage_time <= 0.8 and self.damage_bearing is not None and not urgent:
+        if retreat and not known_threats and t - self.damage_time <= 1.2 and self.damage_bearing is not None and not urgent:
             yaw = self.damage_bearing
             strategic = (pos[0] - 30 * cos(yaw), pos[1] - 30 * sin(yaw))
         if drop is not None and strategic is drop and distance(pos, drop) <= 5:
@@ -807,7 +817,7 @@ class Bot:
             self.zone_jumped |= bool(jump)
             action["jump"] = bool(jump)
             action["boost"] = bool(not me["grounded"] and self.zone_jumped and me["energy"] > 7)
-        if not urgent and not jump and not climb and obs["projectiles"]:
+        if not urgent and not jump and obs["projectiles"]:
             action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
         if retreat and target and target["kind"] != "mech" and danger:

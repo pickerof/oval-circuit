@@ -1,62 +1,86 @@
-"""Steer away from short-horizon projectile intersections."""
+"""Compare short movement trajectories against observed projectile flight."""
 
 from math import atan2, cos, hypot, pi, sin
 
 
 def avoid(arena, obs, movement, boost, radius, height):
     me = obs["self"]
-    x, y, z = me["pos"]
-    vx, vy, _ = me["vel"]
+    pos = me["pos"]
+    x, y, z = pos
+    vx, vy, vz = me["vel"]
     stats = me["stats"]
-    horizon = 0.38
-    speed = stats["boost_speed"] if boost and me["grounded"] else stats["walk_speed"]
-    accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
-    threats = []
-    for proj in obs["projectiles"]:
-        px, py, pz = proj["pos"]
-        pvx, pvy, pvz = proj["vel"]
+    grounded = me["grounded"]
+    speed = stats["boost_speed"] if boost and grounded else stats["walk_speed"]
+    if any(w and w.get("charge", 0) for w in me["weapons"]):
+        speed *= stats["charge_move_mult"]
+    accel = stats["ground_accel"] if grounded else stats["air_accel"]
+    relevant = []
+    for shot in obs["projectiles"]:
+        px, py, pz = shot["pos"]
+        sx, sy, sz = shot["vel"]
         rx, ry = px - x, py - y
-        rvx, rvy = pvx - vx, pvy - vy
-        span = rvx * rvx + rvy * rvy
-        if span < 100 or hypot(rx, ry) > 108:
+        s2 = sx * sx + sy * sy
+        if s2 < 25 or hypot(rx, ry) > 165:
             continue
-        impact = -(rx * rvx + ry * rvy) / span
-        if not 0.04 < impact < horizon:
+        crossing = -(rx * sx + ry * sy) / s2
+        if not 0 < crossing < 0.68:
             continue
-        if hypot(rx + impact * rvx, ry + impact * rvy) > radius + 3.8:
+        mortar = shot["kind"] == "mortar"
+        h = pz + sz * crossing - (11 * crossing * crossing if mortar else 0)
+        if hypot(rx + sx * crossing, ry + sy * crossing) > 7 + speed * crossing:
             continue
-        p_height = pz + pvz * impact
-        if not z - 1.2 <= p_height <= z + height + 1.2:
+        if not z - 6 <= h <= z + height + 8:
             continue
-        if not arena.visible(proj["pos"], (x + vx * impact, y + vy * impact, p_height), stride=3):
-            continue
-        threats.append((impact, rx, ry, rvx, rvy, 1.7 if proj["kind"] == "mortar" else 1))
-    if not threats:
+        relevant.append((crossing, mortar, shot))
+    if not relevant:
         return movement
 
+    _, _, shot = min(relevant, key=lambda row: row[0])
     heading = atan2(movement[1], movement[0])
-    length = hypot(*movement)
-    options = [(0, movement)]
-    for i in (1, -1, 2, -2, 3, -3):
-        angle = heading + i * pi / 4
-        direction = (cos(angle), sin(angle))
-        if arena.walk_line(me["pos"], (x + 5 * direction[0], y + 5 * direction[1]), radius, height):
-            options.append((abs(i) + (i % 2) * 0.05 + (1 - length) * 0.4, direction))
+    dx, dy = shot["vel"][:2]
+    perpendicular = atan2(dy, dx) + pi / 2
+    alternatives = [
+        (cos(heading + i * pi / 4), sin(heading + i * pi / 4)) for i in (1, -1, 2, -2, 3, -3, 4)
+    ]
+    alternatives += [(cos(perpendicular), sin(perpendicular)), (-cos(perpendicular), -sin(perpendicular)), (0, 0)]
+    options = [movement] + [
+        p for p in alternatives if arena.walk_line(pos, (x + 6 * p[0], y + 6 * p[1]), radius, height)
+    ]
+    weights = []
+    for eta, mortar, shot in sorted(relevant, key=lambda row: row[0])[:5]:
+        px, py, pz = shot["pos"]
+        sx, sy, sz = shot["vel"]
+        times = [max(0, eta - 0.1), eta, eta + 0.1]
+        if mortar:
+            times += [eta + 0.2]
+        positions = []
+        for t in times:
+            q = px + sx * t, py + sy * t, pz + sz * t - (11 * t * t if mortar else 0)
+            if not mortar and not arena.visible(shot["pos"], q, stride=2.5):
+                continue
+            positions.append((t, q))
+        if positions:
+            weights.append((mortar, positions))
 
-    def cost(option):
-        penalty, (mx, my) = option
-        dvx, dvy = mx * speed - vx, my * speed - vy
-        delta = hypot(dvx, dvy)
-        for t, rx, ry, rvx, rvy, weight in threats:
-            if delta > 0.01:
-                change_over = min(t, delta / accel)
-                displacement = accel / delta * change_over * (t - change_over * 0.5)
-                gap = hypot(rx + rvx * t - dvx * displacement,
-                            ry + rvy * t - dvy * displacement)
-            else:
-                gap = hypot(rx + rvx * t, ry + rvy * t)
-            penalty += weight * max(0, radius + 0.7 - gap) * 5
-        return penalty
+    def score(option):
+        mx, my = option
+        merit = hypot(mx - movement[0], my - movement[1]) * 1.45
+        tx, ty = mx * speed, my * speed
+        rx, ry = tx - vx, ty - vy
+        dt = hypot(rx, ry) / accel
+        for mortar, positions in weights:
+            impact = 0
+            for t, (px, py, pz) in positions:
+                blend = min(t, dt)
+                offset = (t - blend / 2) * blend / dt if dt > 1e-5 else 0
+                nx = x + vx * t + rx * offset
+                ny = y + vy * t + ry * offset
+                nz = arena.support(nx, ny, z + 1.2) if grounded else z + vz * t - stats["gravity"] * t * t / 2
+                hgap = max(0, nz - pz, pz - nz - height)
+                gap = hypot(px - nx, py - ny, hgap)
+                margin = radius + (7.6 if mortar else 1.0)
+                impact = max(impact, max(0, margin - gap) * (5 if mortar else 7))
+            merit += impact
+        return merit
 
-    turn, result = min(options, key=cost)
-    return result if turn else movement
+    return min(options, key=score)
