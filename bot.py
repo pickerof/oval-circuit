@@ -642,7 +642,9 @@ class Bot:
             if point != tuple(pos[:2]) and not self.arena.walk_line(pos, point, radius, height):
                 continue
             z = self.arena.support(*point, pos[2] + 1.2)
-            eye = (*point, z + height * 0.72)
+            eye = (*point, z + height * 0.80)
+            middle = toward(pos, point, distance(pos, point) / 2)
+            middle_eye = (*middle, self.arena.support(*middle, pos[2] + 1.2) + height * 0.80)
             score = self.zone_cost(point, zone, t)
             score += 0.55 * (distance(point, strategic) - distance(pos, strategic))
             score -= 0.015 * (dx * (point[0] - pos[0]) + dy * (point[1] - pos[1]))
@@ -658,6 +660,8 @@ class Bot:
                             value += max(0, 64 - d) * 1.5
                         lateral = abs(sin(bearing(p, point) - bearing(p, pos))) * d
                         value += max(0, 11 - lateral) * max(0, 155 - d) / 100
+                    if not pressure and d < 145 and self.arena.visible(middle_eye, other, stride=4.5):
+                        value += max(0, 145 - d) * 0.13
                     score += value * confidence
                 else:
                     own_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
@@ -805,11 +809,18 @@ class Bot:
         avoid_duels = obs["alive"] > 2 and zone["radius"] >= 31
         retreat = (t < self.withdraw_until or bool(known_threats and not rival_target) or
                    bool(avoid_duels and rival_target and rival_target.get("hp", 1400) > 310))
+        if rival_target and not avoid_duels and me["in_zone"]:
+            enemy_hp = rival_target.get("hp", 1400)
+            vulnerable = frac < 0.80 and me["hp"] < enemy_hp * 0.78
+            self_arc = any(w and w["kind"] == "lightning" for w in me["weapons"])
+            outranged = ("laser" in rival_target["weapons"] and
+                         not any(w and w["kind"] == "laser" for w in me["weapons"]))
+            if vulnerable or (outranged and not self_arc and me["hp"] < enemy_hp * 0.99):
+                retreat = True
         if rival_target and len(danger) <= 1 and rival_target.get("hp", 1400) < min(315, me["hp"] * 0.42):
             retreat = False
 
-        laser_threat = any("laser" in e["weapons"] and (
-            e["charging"] or angle_error(e["aim"][0], bearing(e["pos"], pos)) < 0.60) for e in danger)
+        laser_threat = any("laser" in e["weapons"] and distance(pos, e["pos"]) < 178 for e in known_threats)
         if laser_threat:
             self.mortar_cooloff = t + 4
         take, _ = self.loot(obs, safe_to_farm=False)
@@ -818,7 +829,9 @@ class Bot:
             mortar_slot = next((i for i, w in enumerate(me["weapons"]) if w and w["kind"] == "mortar"), None)
             if mortar_slot is not None:
                 action["drop"] = mortar_slot
-        safe_to_farm = not danger and not near and frac > 0.62
+        safe_to_farm = not danger and frac > 0.58
+        if near and any(distance(pos, enemy["pos"]) < 67 for enemy in near):
+            safe_to_farm = False
         loot_goal = self.harvest(obs, known_threats, safe_to_farm)
         center = zone["next_center"]
         zone_goal = self.zone_goal(pos, zone)
@@ -842,7 +855,8 @@ class Bot:
             strategic = zone_goal
         elif drop is not None and not near and (frac < 0.83 or me["cubes"] < 10):
             strategic = drop
-        elif avoid_duels and (not safe_to_farm or loot_goal is None or me["cubes"] >= 10):
+        elif (avoid_duels or (retreat and known_threats)) and (
+                not safe_to_farm or loot_goal is None or me["cubes"] >= 10):
             strategic = self.shelter_goal(obs, known_threats, radius, height)
         elif ambush is not None and distance(pos, ambush) > 4:
             strategic = ambush
@@ -869,6 +883,8 @@ class Bot:
         if drop is not None and strategic is drop and distance(pos, drop) <= 5:
             strategic = pos
         if known_threats and not urgent and strategic is not pos:
+            if retreat and distance(pos, strategic) > 18:
+                strategic = self.navigate(pos, strategic, radius, height, t)
             strategic = self.cover_move(obs, strategic, known_threats, retreat, rival_target, radius, height)
         if not urgent:
             self.zone_progress = None
@@ -914,12 +930,13 @@ class Bot:
         if not urgent and not jump and obs["projectiles"]:
             action["move"] = avoid(self.arena, obs, movement, action["boost"], radius, height)
 
-        if retreat and target and target["kind"] != "mech" and danger:
+        if retreat and (target is None or target["kind"] != "mech") and danger:
             target = danger[0]
-        if avoid_duels and retreat and (target is None or target.get("hp", 1400) > 310):
+        point_blank = bool(target and target["kind"] == "mech" and distance(pos, target["pos"]) < 44)
+        if avoid_duels and retreat and not point_blank and (target is None or target.get("hp", 1400) > 310):
             aim, fire = None, [False, False]
         else:
-            aim, fire = self.combat(me, target, muzzle, retreat and obs["alive"] > 2)
+            aim, fire = self.combat(me, target, muzzle, retreat and not point_blank)
         if target and target["kind"] == "mech" or danger or t - self.damage_time < 1.0:
             self.scout_start = None
         if (not target and not danger and t - self.damage_time > 1.0 and me["weapons"].count(None) and
