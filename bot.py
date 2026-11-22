@@ -57,6 +57,7 @@ class Bot:
         self.escape_until = 0
         self.escape_history = []
         self.force_climb = False
+        self.last_damage = {}
         self.damage_time = -100
         self.damage_bearing = None
         self.firing_time = -100
@@ -107,40 +108,48 @@ class Bot:
             if actor["kind"] == "mech":
                 if actor.get("charging"):
                     score -= 18
-                if d < 52:
+                if obs["t"] - self.last_damage.get(actor["id"], -100) < 4:
+                    score -= 58
+                elif d > 85:
+                    score -= 24
+                if d < 42:
                     score -= 30
             visible.append((score, actor["id"], actor))
         chosen = min(visible)[2] if visible else None
         self.target_id = chosen["id"] if chosen else None
         return chosen, [actor for _, _, actor in visible if actor["kind"] == "mech"]
 
-    def shot(self, weapon, target, muzzle):
+    def shot(self, weapon, target, muzzle, barrel=3):
         stats = weapon["stats"]
         kind = weapon["kind"]
         px, py, pz = target["pos"]
         vx, vy, vz = target.get("vel", (0, 0, 0))
         radius, height = self.shape(target)
         time = self.dt * 0.4
+        pitch = 0
         for _ in range(4):
             x, y = px + vx * time, py + vy * time
             z = pz + height * 0.56 + max(-height * 0.35, min(height * 0.45, vz * time))
             d = distance(muzzle, (x, y))
-            if kind in ("gun", "mortar"):
-                time = self.dt * 0.4 + max(0, d - 3) / stats["speed"]
-        dz = z - muzzle[2]
-        if kind == "mortar":
-            speed = stats["speed"]
-            gravity = stats["gravity"]
-            travel = max(0.1, d - 3)
-            discriminant = speed ** 4 - gravity * (gravity * travel ** 2 + 2 * dz * speed ** 2)
-            if discriminant < 0 or d < 13 or time > 2.0:
-                return None
-            pitch = atan2(gravity * travel ** 2 + 2 * dz * speed ** 2,
-                          gravity * travel * (speed ** 2 + sqrt(discriminant)))
-        else:
-            if hypot(d, dz) > stats["range"] - (2 if kind == "lightning" else 0):
-                return None
-            pitch = atan2(dz, d)
+            dz = z - muzzle[2]
+            travel = max(0.1, d - barrel)
+            if kind == "mortar":
+                speed = stats["speed"]
+                gravity = stats["gravity"]
+                discriminant = speed ** 4 - gravity * (gravity * travel ** 2 + 2 * dz * speed ** 2)
+                if discriminant < 0 or d < 13:
+                    return None
+                pitch = atan2(gravity * travel ** 2 + 2 * dz * speed ** 2,
+                              gravity * travel * (speed ** 2 + sqrt(discriminant)))
+                time = self.dt * 0.4 + travel / (speed * cos(pitch))
+                if time > 2.0:
+                    return None
+            else:
+                pitch = atan2(dz, d)
+                if kind == "gun":
+                    time = self.dt * 0.4 + max(0, hypot(d, dz) - barrel) / stats["speed"]
+        if kind != "mortar" and hypot(d, dz) > stats["range"] - (2 if kind == "lightning" else 0):
+            return None
         return bearing(muzzle, (x, y)), pitch, d, radius, height
 
     def combat(self, me, target, muzzle, retreat):
@@ -149,7 +158,10 @@ class Bot:
         fire = [False, False]
         if target is None:
             return None, fire
-        shots = [self.shot(weapon, target, muzzle) if weapon else None for weapon in weapons]
+        mortar_muzzle = (*muzzle[:2], me["pos"][2] + stats["height"] + 0.5)
+        barrel = stats["radius"] + 0.5
+        shots = [self.shot(weapon, target, mortar_muzzle if weapon["kind"] == "mortar" else muzzle, barrel)
+                 if weapon else None for weapon in weapons]
         priority = []
         for index, weapon in enumerate(weapons):
             if not weapon or not shots[index]:
@@ -277,7 +289,7 @@ class Bot:
             return self.tactical_goal
         closest = min(threats, key=lambda e: distance(pos, e["pos"]))
         direction = bearing(closest["pos"], pos)
-        ideal = 39 if any(w and w["kind"] == "lightning" for w in me["weapons"]) else 65
+        ideal = 35 if any(w and w["kind"] == "lightning" for w in me["weapons"]) else 103
         if retreat:
             ideal = 105
         options = [strategic]
@@ -297,7 +309,7 @@ class Bot:
                 if retreat:
                     score += max(0, ideal - d) * (0.85 if i == 0 else 0.45)
                 else:
-                    score += max(0, ideal - d) * 0.7 + max(0, d - ideal - 15) * (0.34 if i == 0 else 0)
+                    score += max(0, ideal - d) * 1.15 + max(0, d - ideal - 12) * (0.48 if i == 0 else 0)
                 if d < 120 and (retreat or enemy is target):
                     eye = (*endpoint, max(pos[2], self.arena.ground(*endpoint)) + height * 0.65)
                     other = (*enemy_pos[:2], enemy_pos[2] + self.shape(enemy)[1] * 0.75)
@@ -400,6 +412,7 @@ class Bot:
             if event["type"] == "damaged":
                 self.damage_time = t
                 if event.get("bearing") is not None:
+                    self.last_damage[event.get("by")] = t
                     self.damage_bearing = event["bearing"]
             elif event["type"] == "hit":
                 self.firing_time = t
@@ -436,7 +449,7 @@ class Bot:
             strategic = toward(zone_goal, center, min(15, distance(zone_goal, center)))
         elif target and target["kind"] == "mech" and not retreat:
             p = target["pos"]
-            strategic = toward(pos, p, min(35, max(0, distance(pos, p) - 44)))
+            strategic = toward(pos, p, min(35, max(0, distance(pos, p) - 96)))
         else:
             # Stay inside the next ring while looking for loot along its interior.
             phase = t / 14 + me["id"]
