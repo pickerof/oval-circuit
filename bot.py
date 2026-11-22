@@ -65,6 +65,7 @@ class Bot:
         self.recent_fire = deque()
         self.damage_time = -100
         self.damage_bearing = None
+        self.heard_fire = None
         self.firing_time = -100
         self.target_id = None
         self.ffa = False
@@ -191,6 +192,22 @@ class Bot:
         if aim is not None and angle_error(yaw, aim[0]) < 1.23:
             return None
         return yaw
+
+    def listen(self, obs, target):
+        t, me = obs["t"], obs["self"]
+        if obs["alive"] <= 4 or (target and target["kind"] == "mech"):
+            self.heard_fire = None
+            return None
+        for sound in obs.get("sounds", ()):
+            yaw = sound["bearing"]
+            if (sound["dist"] == "near" and sound["age"] <= self.dt * 2 and
+                    sound["kind"] in ("gun", "laser_charge") and
+                    angle_error(yaw, me["aim"][0]) > 0.93):
+                self.heard_fire = t + 0.72, yaw
+                break
+        if self.heard_fire and t <= self.heard_fire[0]:
+            return self.heard_fire[1]
+        return None
 
     def observe_motion(self, t, enemies):
         next_motion = {}
@@ -722,6 +739,9 @@ class Bot:
                 aim = [yaw + 0.62 * sin(t * 2.1), 0]
             else:
                 aim = [me["aim"][0] + self.dt * 1.9, 0]
+        heard = self.listen(obs, target)
+        if heard is not None and t - self.damage_time > 0.55:
+            aim, fire = [heard, 0], [False, False]
         guard = self.rear_guard(obs, target, aim)
         if guard is not None:
             aim = [guard, 0]
