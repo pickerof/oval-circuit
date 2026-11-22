@@ -65,6 +65,7 @@ class Bot:
         self.damage_bearing = None
         self.firing_time = -100
         self.target_id = None
+        self.laser_short_until = 0
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -91,19 +92,38 @@ class Bot:
         stats = self.config["npc" if actor["kind"] == "npc" else "crates"]
         return stats["radius"], stats["height"]
 
+    def laser_damage(self, weapon, me, target, charge):
+        stats = weapon["stats"]
+        cubes = self.config["cubes"]
+        power = 1 + min(me["cubes"], cubes["stat_cap"]) * cubes["damage_per_cube"]
+        fraction = stats["min_frac"] + (1 - stats["min_frac"]) * min(1, charge / stats["charge"])
+        damage = stats["damage"] * fraction * power
+        if "mortar" in target.get("weapons", ()):
+            damage *= 1 + stats["cookoff"]
+        aim = target.get("aim")
+        mech = self.config["mech"]
+        if aim and angle_error(aim[0], bearing(target["pos"], me["pos"])) > mech["front_arc_deg"] * pi / 360 + 0.15:
+            damage *= mech["rear_mult"]
+        return damage
+
     def target(self, obs, actors, muzzle):
         me = obs["self"]
         pos = me["pos"]
         maximum = max((w["stats"].get("range", 170) for w in me["weapons"] if w), default=0)
+        laser = next((w for w in me["weapons"] if w and w["kind"] == "laser"), None)
         visible = []
         for actor in actors:
             d = distance(pos, actor["pos"])
             if d > maximum + 4:
                 continue
             _, height = self.shape(actor)
-            point = (*actor["pos"][:2], actor["pos"][2] + height * 0.57)
+            x, y, z = actor["pos"]
+            point = (x, y, z + height * 0.56)
             if not self.arena.visible(muzzle, point):
-                continue
+                shoulder = (x, y, z + height * 0.82)
+                if actor["kind"] != "mech" or d > 160 or not self.arena.visible(muzzle, shoulder):
+                    continue
+                actor = dict(actor, aim_height=0.82)
             score = d + actor.get("hp", 1400) * 0.035
             score += {"mech": -65, "npc": 4, "crate": 0}[actor["kind"]]
             if actor["id"] == self.target_id:
@@ -117,6 +137,11 @@ class Bot:
                     score -= 24
                 if d < 42:
                     score -= 30
+                if laser and obs["t"] >= self.laser_short_until and laser["cooldown"] < 0.48:
+                    damage = self.laser_damage(laser, me, actor, laser["stats"]["charge"])
+                    score -= min(30, (damage - laser["stats"]["damage"]) * 0.073)
+                    if actor.get("hp", 1400) < damage * 0.86:
+                        score -= 34
             visible.append((score, actor["id"], actor))
         chosen = min(visible)[2] if visible else None
         self.target_id = chosen["id"] if chosen else None
@@ -132,7 +157,7 @@ class Bot:
         pitch = 0
         for _ in range(4):
             x, y = px + vx * time, py + vy * time
-            z = pz + height * 0.56 + max(-height * 0.35, min(height * 0.45, vz * time))
+            z = pz + height * target.get("aim_height", 0.56) + max(-height * 0.35, min(height * 0.45, vz * time))
             d = distance(muzzle, (x, y))
             dz = z - muzzle[2]
             travel = max(0.1, d - barrel)
@@ -155,7 +180,7 @@ class Bot:
             return None
         return bearing(muzzle, (x, y)), pitch, d, radius, height
 
-    def combat(self, me, target, muzzle, retreat):
+    def combat(self, me, target, muzzle, retreat, now=0):
         weapons = me["weapons"]
         stats = me["stats"]
         fire = [False, False]
@@ -165,6 +190,7 @@ class Bot:
         barrel = stats["radius"] + 0.5
         shots = [self.shot(weapon, target, mortar_muzzle if weapon["kind"] == "mortar" else muzzle, barrel)
                  if weapon else None for weapon in weapons]
+        laser_release = set()
         priority = []
         for index, weapon in enumerate(weapons):
             if not weapon or not shots[index]:
@@ -176,8 +202,20 @@ class Bot:
                 score = 3 if weapon.get("reload", 0) == 0 and weapon.get("ammo", 0) > 0 else 0
             elif kind == "lightning" and me["energy"] >= state["energy"] + (8 if retreat else 2):
                 score = 5 if weapon["cooldown"] < self.dt else 1
-            elif kind == "laser" and not retreat:
-                score = 7 if weapon.get("charge", 0) else (4 if weapon["cooldown"] < self.dt else 0)
+                if score == 5 and target.get("charging"):
+                    score += 3
+            elif kind == "laser" and not retreat and now >= self.laser_short_until:
+                charge = weapon.get("charge", 0)
+                release = charge >= state["charge"] - self.dt * 0.25
+                if target["kind"] == "mech" and charge >= state["min_charge"]:
+                    release |= target.get("hp", 1400) <= 0.82 * self.laser_damage(weapon, me, target, charge)
+                if release:
+                    laser_release.add(index)
+                    score = 9
+                elif charge:
+                    score = 1
+                elif weapon["cooldown"] < self.dt:
+                    score = 4
             elif kind == "mortar" and weapon["cooldown"] <= self.dt:
                 score = 4 if shots[index][2] < 90 or target["kind"] != "mech" else 2
             priority.append((score, index))
@@ -204,10 +242,10 @@ class Bot:
                           abs(sp - me["aim"][1]) < tilt + height * 0.35 / max(1, d))))
             if kind == "laser":
                 charge = weapon.get("charge", 0)
-                if retreat:
+                if retreat or now < self.laser_short_until:
                     continue
                 if charge:
-                    fire[index] = (charge < state["charge"] - self.dt * 0.25 or not lined_up)
+                    fire[index] = index not in laser_release or not lined_up
                 else:
                     fire[index] = index == chosen and weapon["cooldown"] <= self.dt and lined_up
             elif lined_up and weapon["cooldown"] <= self.dt:
@@ -425,6 +463,8 @@ class Bot:
                     self.damage_bearing = event["bearing"]
             elif event["type"] == "hit":
                 self.firing_time = t
+            elif event["type"] == "effect" and event.get("effect") == "short":
+                self.laser_short_until = t + self.config["weapons"]["lightning"]["short_s"]
 
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: distance(pos, e["pos"]))
@@ -529,7 +569,7 @@ class Bot:
         if retreat and target and not fight_while_withdrawing and (
                 target["kind"] != "mech" or (distance(pos, target["pos"]) > 42 and frac < 0.55)):
             target = None
-        aim, fire = self.combat(me, target, muzzle, retreat and not fight_while_withdrawing)
+        aim, fire = self.combat(me, target, muzzle, retreat and not fight_while_withdrawing, t)
         if aim is None:
             if self.damage_bearing is not None and t - self.damage_time < 1.4:
                 aim = [self.damage_bearing, 0]
