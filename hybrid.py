@@ -40,7 +40,7 @@ class Bot:
             exit_point = x + 14 * dx, y + 14 * dy
             if arena.walk_line(me["pos"], exit_point, stats["radius"] + 0.25, stats["height"]):
                 walkable += 1
-        if covered >= 4 and walkable >= 3:
+        if covered < 4 and walkable >= 3:
             return self.return_fire
         return self.withdrawal
 
