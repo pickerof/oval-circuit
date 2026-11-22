@@ -882,7 +882,8 @@ class Bot:
             strategic = (pos[0] - 30 * cos(yaw), pos[1] - 30 * sin(yaw))
         if drop is not None and strategic is drop and distance(pos, drop) <= 5:
             strategic = pos
-        if known_threats and not urgent and strategic is not pos:
+        tactical_selected = bool(known_threats and not urgent and strategic is not pos)
+        if tactical_selected:
             if retreat and distance(pos, strategic) > 18:
                 strategic = self.navigate(pos, strategic, radius, height, t)
             strategic = self.cover_move(obs, strategic, known_threats, retreat, rival_target, radius, height)
@@ -900,7 +901,12 @@ class Bot:
             self.zone_escape = None
             self.zone_progress = pos, t
         escape = self.escape(pos, strategic, radius, height, t)
-        waypoint = escape if escape is not None else self.navigate(pos, strategic, radius, height, t)
+        waypoint = escape
+        if waypoint is None:
+            if tactical_selected and self.arena.walk_line(pos, strategic, radius, height):
+                waypoint = strategic
+            else:
+                waypoint = self.navigate(pos, strategic, radius, height, t)
         if self.zone_escape is not None:
             waypoint = self.zone_escape
         d = distance(pos, waypoint)
