@@ -3,7 +3,7 @@
 from array import array
 from collections import defaultdict
 from heapq import heappop, heappush
-from math import ceil, floor, hypot
+from math import ceil, floor, hypot, log
 from pathlib import Path
 from time import perf_counter
 import json
@@ -69,8 +69,43 @@ class Arena:
                 for j in range(floor((bottom - self.clearance) / self.bucket),
                                floor((top + self.clearance) / self.bucket) + 1):
                     self.prisms[i, j].append(item)
+        self.configure_foliage(world)
         self.walk_cache = {}
         self.edge_cache = {}
+
+    def configure_foliage(self, world):
+        self.foliage = defaultdict(list)
+        rules = world["rules"]
+        self.foliage_limit = -log(rules["canopyBlockT"]) / rules["canopyDensity"]
+        trees = world["trees"]
+        fields = trees["fields"]
+        data = iter(trees["data"])
+        for row in zip(*([data] * len(fields))):
+            tree = dict(zip(fields, row))
+            x, y, radius = tree["crownX"], tree["crownY"], tree["crownR"]
+            low, high = tree["z"] + tree["crownBase"], tree["z"] + tree["height"]
+            item = x, y, radius * radius, low, high
+            for i in range(floor((x - radius) / self.bucket), floor((x + radius) / self.bucket) + 1):
+                for j in range(floor((y - radius) / self.bucket), floor((y + radius) / self.bucket) + 1):
+                    self.foliage[i, j].append(item)
+
+    def veiled(self, start, end):
+        x, y, z = start
+        dx, dy, dz = end[0] - x, end[1] - y, end[2] - z
+        length = hypot(dx, dy, dz)
+        count = max(1, ceil(length / 2))
+        covered = 0
+        for i in range(1, count):
+            f = i / count
+            sx, sy, sz = x + dx * f, y + dy * f, z + dz * f
+            for tx, ty, radius_sq, low, high in self.foliage.get(
+                    (floor(sx / self.bucket), floor(sy / self.bucket)), ()):
+                if low <= sz <= high and (sx - tx) ** 2 + (sy - ty) ** 2 <= radius_sq:
+                    covered += length / count
+                    if covered >= self.foliage_limit:
+                        return True
+                    break
+        return False
 
     def ground(self, x, y):
         i = max(0, min(self.nx - 1, int((x - self.x0) / self.step + 0.5)))

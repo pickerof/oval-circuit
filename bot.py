@@ -87,6 +87,8 @@ class Bot:
         self.loot_clock = -100
         self.loot_plan = None
         self.mortar_cooloff = -100
+        self.scout_start = None
+        self.scout_time = -100
 
     def zone_goal(self, pos, zone):
         center = zone["next_center"]
@@ -484,7 +486,9 @@ class Bot:
                 self.known_loot[item["id"]] = t, kind, item
         if t - self.loot_clock < 0.6 and self.loot_plan:
             cost, item_id, point = self.loot_plan
-            if cost < 108 and distance(pos, point) > 3 and t - self.known_loot[item_id][0] < 3.5:
+            old_kind = self.known_loot[item_id][1]
+            if (cost < 108 and distance(pos, point) > 3 and t - self.known_loot[item_id][0] < 3.5 and
+                    (safe_to_farm or old_kind == "cube")):
                 return point
         self.loot_clock = t
         self.known_loot = {i: row for i, row in self.known_loot.items()
@@ -494,7 +498,7 @@ class Bot:
         for item_id, (last, kind, item) in self.known_loot.items():
             point = item["pos"]
             d = distance(pos, point)
-            if d > 170 or abs(point[2] - pos[2]) > 5.5:
+            if d > 190 or abs(point[2] - pos[2]) > 5.5:
                 continue
             cost = d + self.zone_cost(point, zone, t) + (t - last) * 2.5
             if kind == "cube":
@@ -507,7 +511,7 @@ class Bot:
                 weapon = item["kind"]
                 if weapon in armed or weapon == "gun" or "laser" in armed:
                     continue
-                cost -= 54 if weapon == "laser" else 27
+                cost -= 92 if weapon == "laser" else 48
                 if not safe_to_farm and d > 24:
                     continue
             elif not safe_to_farm or me["cubes"] >= 8:
@@ -583,8 +587,11 @@ class Bot:
                 cover = 0
                 for dx, dy in corners:
                     x, y = lx + dx * 58, ly + dy * 58
-                    if not self.arena.visible(eye, (x, y, self.arena.ground(x, y) + 7), stride=3.7):
+                    other = (x, y, self.arena.ground(x, y) + 7)
+                    if not self.arena.visible(eye, other, stride=3.7):
                         cover += 1
+                    elif self.arena.veiled(eye, other):
+                        cover += 0.65
                 self.shelter_costs[cache_key] = cover
             cost -= 5.2 * cover
             for enemy in threats:
@@ -593,7 +600,8 @@ class Bot:
                 other = (*p[:2], p[2] + self.shape(enemy)[1] * 0.7)
                 cost += max(0, 115 - d) * 0.65
                 if d < 195 and self.arena.visible(eye, other, stride=3.7):
-                    cost += max(0, 195 - d) * 0.35
+                    unseen = d > 68 and self.arena.veiled(eye, other)
+                    cost += max(0, 195 - d) * (0.18 if unseen else 0.35)
             if best is None or cost < best[0]:
                 best = cost, point
         self.shelter = best[1] if best else anchor
@@ -890,7 +898,7 @@ class Bot:
         self.location = pos
         climb = (escape is not None and self.force_climb) or self.stuck >= 5 or (not me["grounded"] and d > 4 and
                                     not self.arena.walk_line(pos, waypoint, radius, height))
-        sprint = d > 5 and (urgent or retreat or (not exposed and distance(pos, strategic) > 100))
+        sprint = d > 5 and (urgent or retreat or (not exposed and distance(pos, strategic) > 50))
         if escape is not None and self.force_climb and me["grounded"] and me["energy"] <= 28:
             sprint = False
         jump = bool(me["grounded"] and climb and me["energy"] > 28)
@@ -912,6 +920,18 @@ class Bot:
             aim, fire = None, [False, False]
         else:
             aim, fire = self.combat(me, target, muzzle, retreat and obs["alive"] > 2)
+        if target and target["kind"] == "mech" or danger or t - self.damage_time < 1.0:
+            self.scout_start = None
+        if (not target and not danger and t - self.damage_time > 1.0 and me["weapons"].count(None) and
+                loot_goal is None and t - self.scout_time >= 6):
+            if self.scout_start is None:
+                self.scout_start = t, me["aim"][0]
+            started, yaw = self.scout_start
+            if t - started < 1.45:
+                aim = [yaw + (t - started + self.dt) * 3.85, 0]
+            else:
+                self.scout_start = None
+                self.scout_time = t
         if aim is None:
             if self.damage_bearing is not None and t - self.damage_time < 1.4:
                 aim = [self.damage_bearing, 0]
@@ -923,7 +943,7 @@ class Bot:
             else:
                 aim = [me["aim"][0] + self.dt * 1.9, 0]
         heard = self.listen(obs, target)
-        if heard is not None and t - self.damage_time > 0.55 and (target is None or retreat):
+        if heard is not None and self.scout_start is None and t - self.damage_time > 0.55 and (target is None or retreat):
             aim, fire = [heard, 0], [False, False]
         guard = self.rear_guard(obs, target, aim)
         if guard is not None:
